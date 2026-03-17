@@ -1,0 +1,56 @@
+[
+    {
+        "benchmark": "tfbind8",
+        "method": "tpe",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs"
+    },
+    {
+        "benchmark": "tfbind10",
+        "method": "tpe",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs"
+    },
+    {
+        "benchmark": "superconductor",
+        "method": "tpe",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs"
+    },
+    {
+        "benchmark": "ant",
+        "method": "tpe",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs"
+    },
+    {
+        "benchmark": "dkitty",
+        "method": "tpe",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs"
+    },
+    {
+        "benchmark": "chembl",
+        "method": "tpe",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs"
+    }
+]

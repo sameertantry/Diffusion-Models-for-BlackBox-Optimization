@@ -1,0 +1,27 @@
+{
+    "method": "diffusion",
+    "algorithm_name": "DiffusionBBO_quick",
+    "suite_name": "bbob",
+    "suite_instance": "",
+    "suite_options": "dimensions: 2 instance_indices: 1",
+    "budget_multiplier": 10,
+    "eval_batch_size": 1,
+    "precision": 1e-8,
+    "output_folder": "exdata/DiffusionBBO_quick",
+    "post_process": true,
+    "optimizer": {
+        "num_train_timesteps": 50,
+        "num_inference_steps": 50,
+        "beta_schedule": "linear",
+        "hidden_dim": 128,
+        "time_embed_dim": 32,
+        "batch_size": 32,
+        "lr_diffusion": 1e-3,
+        "lr_regressor": 1e-3,
+        "train_steps": 50,
+        "quantile": 0.8,
+        "guidance_strength": 5.0,
+        "seed": 42,
+        "min_data": 32
+    }
+}

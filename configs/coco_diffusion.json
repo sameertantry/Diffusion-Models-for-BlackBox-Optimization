@@ -1,0 +1,35 @@
+{
+    "method": "diffusion",
+    "algorithm_name": "Diffusion-predefence",
+    "suite_name": "bbob",
+    "suite_instance": "",
+    "suite_options": "dimensions: 2 instance_indices: 1-2",
+    "budget_multiplier": 1024,
+    "eval_batch_size": 64,
+    "precision": 0.1,
+    "output_folder": "parameter_tuning/Diffusion-big-model-quantile",
+    "post_process": true,
+    "optimizer": {
+        "num_timesteps": 100,
+        "use_regressor": false,
+        "beta_schedule": "squaredcos_cap_v2",
+        "prediction_type": "epsilon",
+        "clip_sample": false,
+        "clip_sample_range": 1.0,
+        "hidden_dim": 256,
+        "time_embed_dim": 32,
+        "depth": 5,
+        "batch_size": 128,
+        "lr_diffusion": 0.0001,
+        "lr_regressor": 0.001,
+        "train_steps": 100,
+        "quantile": {
+            "0": 0.95,
+            "70": 0.99
+        },
+        "guidance_strength": 1.0,
+        "seed": 42,
+        "min_data": 0.4,
+        "verbose": true
+    }
+}

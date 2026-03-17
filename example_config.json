@@ -1,0 +1,45 @@
+[
+  {
+    "benchmark": "sphere",
+    "input_dim": 10,
+    "method": "tpe",
+    "num_iterations": 200,
+    "eval_batch_size": 1,
+    "seeds": 2,
+    "log_every": 20,
+    "output_dir": "outputs"
+  },
+  {
+    "benchmark": "sphere",
+    "input_dim": 10,
+    "method": "cma_es",
+    "num_iterations": 200,
+    "eval_batch_size": 1,
+    "sigma0": 0.5,
+    "seeds": 2,
+    "log_every": 20,
+    "output_dir": "outputs"
+  },
+  {
+    "benchmark": "sphere",
+    "input_dim": 10,
+    "method": "diffusion",
+    "num_iterations": 200,
+    "eval_batch_size": 1,
+    "num_train_timesteps": 100,
+    "num_inference_steps": 100,
+    "beta_schedule": "linear",
+    "hidden_dim": 256,
+    "time_embed_dim": 64,
+    "batch_size": 128,
+    "lr_diffusion": 0.001,
+    "lr_regressor": 0.001,
+    "train_steps": 200,
+    "quantile": 0.9,
+    "guidance_strength": 1.0,
+    "min_data": 64,
+    "seeds": 1,
+    "log_every": 20,
+    "output_dir": "outputs"
+  }
+]

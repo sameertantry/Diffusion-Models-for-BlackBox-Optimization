@@ -1,0 +1,17 @@
+{
+    "method": "cma_es",
+    "algorithm_name": "CMA-ES-predefence",
+    "suite_name": "bbob",
+    "suite_instance": "",
+    "suite_options": "dimensions: 2,3,5,10,20 instance_indices: 1-5",
+    "budget_multiplier": 1000,
+    "eval_batch_size": 64,
+    "precision": 1e-2,
+    "output_folder": "exdata/CMA-ES",
+    "post_process": false,
+    "optimizer": {
+        "seed": 42,
+        "sigma0": 0.5,
+        "verbose": false
+    }
+}

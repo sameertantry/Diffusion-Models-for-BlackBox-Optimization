@@ -1,0 +1,30 @@
+{
+    "method": "diffusion",
+    "algorithm_name": "DiffusionOpt_tuned",
+    "suite_name": "bbob",
+    "suite_instance": "",
+    "suite_options": "dimensions: 2,3,5,10,20 instance_indices: 1-5",
+    "budget_multiplier": 5000,
+    "eval_batch_size": 10,
+    "precision": 1e-8,
+    "output_folder": "exdata/DiffusionOpt_tuned",
+    "post_process": false,
+    "optimizer": {
+        "num_train_timesteps": 100,
+        "num_inference_steps": 50,
+        "beta_schedule": "squaredcos_cap_v2",
+        "prediction_type": "epsilon",
+        "clip_sample": false,
+        "clip_sample_range": 1.0,
+        "hidden_dim": 128,
+        "time_embed_dim": 32,
+        "batch_size": 32,
+        "lr_diffusion": 1e-3,
+        "lr_regressor": 1e-3,
+        "train_steps": 500,
+        "quantile": 0.5,
+        "guidance_strength": 10.0,
+        "seed": 42,
+        "min_data": 32
+    }
+}

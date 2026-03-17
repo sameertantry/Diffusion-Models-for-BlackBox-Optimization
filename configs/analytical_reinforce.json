@@ -1,0 +1,62 @@
+[
+  {
+    "benchmark": "sphere",
+    "input_dim": 10,
+    "method": "reinforce",
+    "num_iterations": 200,
+    "eval_batch_size": 32,
+    "reinforce_lr": 0.01,
+    "reinforce_pop_size": 32,
+    "reinforce_init_std": 0.3,
+    "reinforce_use_rank_transform": true,
+    "warm_start_n": 0,
+    "seeds": 3,
+    "log_every": 20,
+    "output_dir": "outputs"
+  },
+  {
+    "benchmark": "rosenbrock",
+    "input_dim": 10,
+    "method": "reinforce",
+    "num_iterations": 200,
+    "eval_batch_size": 32,
+    "reinforce_lr": 0.01,
+    "reinforce_pop_size": 32,
+    "reinforce_init_std": 0.3,
+    "reinforce_use_rank_transform": true,
+    "warm_start_n": 0,
+    "seeds": 3,
+    "log_every": 20,
+    "output_dir": "outputs"
+  },
+  {
+    "benchmark": "rastrigin",
+    "input_dim": 10,
+    "method": "reinforce",
+    "num_iterations": 200,
+    "eval_batch_size": 32,
+    "reinforce_lr": 0.01,
+    "reinforce_pop_size": 32,
+    "reinforce_init_std": 0.3,
+    "reinforce_use_rank_transform": true,
+    "warm_start_n": 0,
+    "seeds": 3,
+    "log_every": 20,
+    "output_dir": "outputs"
+  },
+  {
+    "benchmark": "ackley",
+    "input_dim": 10,
+    "method": "reinforce",
+    "num_iterations": 200,
+    "eval_batch_size": 32,
+    "reinforce_lr": 0.01,
+    "reinforce_pop_size": 32,
+    "reinforce_init_std": 0.3,
+    "reinforce_use_rank_transform": true,
+    "warm_start_n": 0,
+    "seeds": 3,
+    "log_every": 20,
+    "output_dir": "outputs"
+  }
+]

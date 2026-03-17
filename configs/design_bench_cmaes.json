@@ -1,0 +1,62 @@
+[
+    {
+        "benchmark": "tfbind8",
+        "method": "cma_es",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs",
+        "sigma0": 0.5
+    },
+    {
+        "benchmark": "tfbind10",
+        "method": "cma_es",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs",
+        "sigma0": 0.5
+    },
+    {
+        "benchmark": "superconductor",
+        "method": "cma_es",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs",
+        "sigma0": 0.5
+    },
+    {
+        "benchmark": "ant",
+        "method": "cma_es",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs",
+        "sigma0": 0.5
+    },
+    {
+        "benchmark": "dkitty",
+        "method": "cma_es",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs",
+        "sigma0": 0.5
+    },
+    {
+        "benchmark": "chembl",
+        "method": "cma_es",
+        "num_iterations": 200,
+        "eval_batch_size": 10,
+        "seeds": 3,
+        "log_every": 20,
+        "output_dir": "outputs",
+        "sigma0": 0.5
+    }
+]
