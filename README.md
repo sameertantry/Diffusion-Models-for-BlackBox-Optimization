@@ -1,1 +1,1 @@
-# DIffision Models for BlackBox Optimization
+# DIffusion Models for BlackBox Optimization
