@@ -141,6 +141,238 @@ class _Regressor(nn.Module):
 
 
 # ------------------------------------------------------------------ #
+# FiLM-conditioned Residual Noise Predictor                           #
+# ------------------------------------------------------------------ #
+
+
+class _FiLMBlock(nn.Module):
+    """Residual block with FiLM (Feature-wise Linear Modulation).
+
+    The conditioning vector produces per-block scale (gamma) and shift
+    (beta) that modulate the LayerNorm output before the MLP.  This
+    injects time+y information at every depth, preventing the signal
+    dilution that occurs with input-only concatenation.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.film = nn.Linear(hidden_dim, 2 * hidden_dim)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        gamma, beta = self.film(cond).chunk(2, dim=-1)
+        h = h * (1.0 + gamma) + beta
+        h = self.act(self.linear1(h))
+        h = self.linear2(h)
+        return x + h
+
+
+class _FiLMResNetDDPM(nn.Module):
+    """Noise predictor with FiLM-conditioned residual blocks.
+
+    Improvements over ``_ConditionalDDPM``
+    --------------------------------------
+    1. **Residual connections** — the network can approximate the identity
+       for low-noise timesteps (near t=0) where the noise to predict is
+       small.  Without skip connections a plain MLP must learn this from
+       scratch, which is hard for deeper networks.
+    2. **FiLM conditioning at every layer** — time and y are projected
+       into a shared conditioning vector that modulates hidden features
+       via learned scale+shift at each residual block.  This prevents
+       the conditioning signal from being diluted through depth.
+    3. **LayerNorm** — stabilises online training when the data
+       distribution shifts between tell() cycles.
+
+    Scalability
+    -----------
+    ``hidden_dim`` controls width, ``depth`` controls the number of
+    residual blocks (``depth - 1`` blocks).  ``time_dim`` controls the
+    sinusoidal embedding size.  The forward signature is identical to
+    ``_ConditionalDDPM``.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, time_dim: int, depth: int = 3):
+        super().__init__()
+        if depth < 2:
+            raise ValueError(f"depth must be >= 2, got {depth}")
+
+        self.time_embed = _TimeEmbedding(time_dim)
+
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(time_dim + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        n_blocks = max(depth - 1, 1)
+        self.blocks = nn.ModuleList([_FiLMBlock(hidden_dim) for _ in range(n_blocks)])
+
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, y_cond: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_embed(t)
+        y_cond = y_cond.view(-1, 1)
+        cond = self.cond_mlp(torch.cat([t_emb, y_cond], dim=-1))
+
+        h = self.input_proj(x_t)
+        for block in self.blocks:
+            h = block(h, cond)
+        return self.output_proj(h)
+
+
+# ------------------------------------------------------------------ #
+# Adaptive-LayerNorm Residual Noise Predictor (DiT-style)             #
+# ------------------------------------------------------------------ #
+
+
+class _AdaLNBlock(nn.Module):
+    """Residual block with Adaptive Layer Normalization (DiT-style).
+
+    The conditioning vector produces normalisation scale, shift, AND a
+    gate factor.  The gate is zero-initialised so at init each block
+    contributes nothing — the whole network is the identity, which is
+    the correct inductive bias for epsilon-prediction at low noise.
+    """
+
+    def __init__(self, hidden_dim: int):
+        super().__init__()
+        self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.linear1 = nn.Linear(hidden_dim, hidden_dim)
+        self.act = nn.SiLU()
+        self.linear2 = nn.Linear(hidden_dim, hidden_dim)
+        self.adaln_proj = nn.Linear(hidden_dim, 3 * hidden_dim)
+        nn.init.zeros_(self.adaln_proj.weight)
+        nn.init.zeros_(self.adaln_proj.bias)
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma, beta, gate = self.adaln_proj(cond).chunk(3, dim=-1)
+        h = self.norm(x) * (1.0 + gamma) + beta
+        h = self.act(self.linear1(h))
+        h = self.linear2(h)
+        return x + gate * h
+
+
+class _AdaLNResNetDDPM(nn.Module):
+    """Noise predictor with Adaptive LayerNorm residual blocks.
+
+    Inspired by the **DiT** (Diffusion Transformer) architecture
+    adapted here as a pure MLP for low-dimensional data.
+
+    Improvements over ``_ConditionalDDPM``
+    --------------------------------------
+    1. **Adaptive LayerNorm (AdaLN)** — the conditioning vector controls
+       the normalisation parameters (scale and shift) directly, tightly
+       coupling conditioning with feature processing.  Unlike FiLM
+       which keeps learnable norm parameters, AdaLN sets
+       ``elementwise_affine=False`` so ALL normalisation is
+       conditioning-dependent.
+    2. **Gated residuals with zero-init** — each block's contribution is
+       multiplied by a learned gate that starts at zero.  At
+       initialisation the entire network is the identity, meaning it
+       predicts zero noise — the correct output for clean data at t=0.
+       This dramatically stabilises early training.
+    3. **Zero-initialised output projection** — reinforces the
+       identity-at-init property end-to-end.
+
+    Scalability
+    -----------
+    Same knobs as ``_FiLMResNetDDPM``: ``hidden_dim``, ``depth``,
+    ``time_dim``.  Slightly more parameters per block than FiLM due
+    to the 3-way (scale, shift, gate) projection.
+    """
+
+    def __init__(self, input_dim: int, hidden_dim: int, time_dim: int, depth: int = 3):
+        super().__init__()
+        if depth < 2:
+            raise ValueError(f"depth must be >= 2, got {depth}")
+
+        self.time_embed = _TimeEmbedding(time_dim)
+
+        self.cond_mlp = nn.Sequential(
+            nn.Linear(time_dim + 1, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        self.input_proj = nn.Linear(input_dim, hidden_dim)
+
+        n_blocks = max(depth - 1, 1)
+        self.blocks = nn.ModuleList([_AdaLNBlock(hidden_dim) for _ in range(n_blocks)])
+
+        self.final_norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
+        self.final_adaln = nn.Linear(hidden_dim, 2 * hidden_dim)
+        nn.init.zeros_(self.final_adaln.weight)
+        nn.init.zeros_(self.final_adaln.bias)
+        self.output_proj = nn.Linear(hidden_dim, input_dim)
+        nn.init.zeros_(self.output_proj.weight)
+        nn.init.zeros_(self.output_proj.bias)
+
+    def forward(self, x_t: torch.Tensor, t: torch.Tensor, y_cond: torch.Tensor) -> torch.Tensor:
+        t_emb = self.time_embed(t)
+        y_cond = y_cond.view(-1, 1)
+        cond = self.cond_mlp(torch.cat([t_emb, y_cond], dim=-1))
+
+        h = self.input_proj(x_t)
+        for block in self.blocks:
+            h = block(h, cond)
+
+        gamma, beta = self.final_adaln(cond).chunk(2, dim=-1)
+        h = self.final_norm(h) * (1.0 + gamma) + beta
+        return self.output_proj(h)
+
+
+# ------------------------------------------------------------------ #
+# Noise-predictor registry / factory                                   #
+# ------------------------------------------------------------------ #
+
+_NOISE_PREDICTOR_REGISTRY: Dict[str, type] = {
+    "concat_mlp": _ConditionalDDPM,
+    "film_resnet": _FiLMResNetDDPM,
+    "adaln_resnet": _AdaLNResNetDDPM,
+}
+
+
+def create_noise_predictor(
+    arch: str,
+    input_dim: int,
+    hidden_dim: int,
+    time_dim: int,
+    depth: int = 3,
+) -> nn.Module:
+    """Instantiate a noise predictor by architecture name.
+
+    Parameters
+    ----------
+    arch : str
+        One of ``"concat_mlp"``, ``"film_resnet"``, ``"adaln_resnet"``.
+    input_dim, hidden_dim, time_dim, depth
+        Forwarded to the constructor (identical signature for all).
+
+    Returns
+    -------
+    nn.Module
+        Network with ``forward(x_t, t, y_cond)`` interface.
+    """
+    if arch not in _NOISE_PREDICTOR_REGISTRY:
+        raise ValueError(
+            f"Unknown noise predictor architecture {arch!r}. "
+            f"Supported: {sorted(_NOISE_PREDICTOR_REGISTRY)}"
+        )
+    cls = _NOISE_PREDICTOR_REGISTRY[arch]
+    return cls(input_dim, hidden_dim, time_dim, depth=depth)
+
+
+# ------------------------------------------------------------------ #
 # Optimizer                                                           #
 # ------------------------------------------------------------------ #
 

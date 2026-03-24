@@ -50,6 +50,7 @@ class BaseOptimizer(ABC):
         self._verbose_taus: list[float] = []
         self._verbose_log_dir: Optional[Path] = None
         self.verbose_log_path: Optional[Path] = None
+        self._verbose_problem_tag: Optional[str] = None
 
     @abstractmethod
     def ask(self, n: int = 1) -> np.ndarray:
@@ -149,6 +150,10 @@ class BaseOptimizer(ABC):
         self._pending_iteration_indices = self._pending_iteration_indices[n:]
         self._flush_verbose_log()
 
+    def set_problem_tag(self, tag: str) -> None:
+        """Set a human-readable tag (e.g. 'f1_d2_i3') embedded in the npz filename."""
+        self._verbose_problem_tag = tag
+
     def _flush_verbose_log(self) -> None:
         """Persist verbose arrays to disk as a single .npz file."""
         if not self.verbose:
@@ -157,9 +162,10 @@ class BaseOptimizer(ABC):
             safe_name = self.name.lower().replace(" ", "_")
             ts = time.strftime("%Y%m%d_%H%M%S")
             unique = time.time_ns()
+            tag = f"_{self._verbose_problem_tag}" if self._verbose_problem_tag else ""
             out_dir = self._verbose_log_dir or (Path("outputs") / "verbose_logs")
             out_dir.mkdir(parents=True, exist_ok=True)
-            self.verbose_log_path = out_dir / f"{safe_name}_{ts}_{unique}.npz"
+            self.verbose_log_path = out_dir / f"{safe_name}{tag}_{ts}_{unique}.npz"
 
         if self._verbose_samples:
             samples = np.vstack(self._verbose_samples).astype(np.float64, copy=False)
@@ -288,6 +294,7 @@ class BaseOptimizer(ABC):
         self._verbose_indexes = []
         self._verbose_taus = []
         self.verbose_log_path = None
+        self._verbose_problem_tag = None
 
     @abstractmethod
     def reset(self) -> None:

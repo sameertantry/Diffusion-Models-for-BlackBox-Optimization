@@ -70,6 +70,7 @@ from methods.base import BaseOptimizer
 from methods.cma_es import CMAES
 from methods.diffusion import DiffusionOptimizer
 from methods.diffusion_bbo import DiffusionBBO
+from methods.diffusion_v2 import DiffusionOptimizerV2
 from methods.tpe import TPE
 
 # --------------------------------------------------------------------------- #
@@ -302,9 +303,39 @@ def make_diffusion_bbo_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
     return _factory
 
 
+def make_diffusion_v2_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
+    """Create a factory that produces :class:`DiffusionOptimizerV2` instances.
+
+    Parameters
+    ----------
+    **optimizer_kwargs
+        Keyword arguments accepted by :class:`DiffusionOptimizerV2`
+        (e.g. ``elite_per_dim``, ``cfg_scale``, ``ema_decay``).
+
+    Returns
+    -------
+    OptimizerFactory
+        A callable ``(dimension, lower_bounds, upper_bounds) -> DiffusionOptimizerV2``.
+    """
+
+    def _factory(
+        dimension: int,
+        lower_bounds: np.ndarray,
+        upper_bounds: np.ndarray,
+    ) -> DiffusionOptimizerV2:
+        return DiffusionOptimizerV2(
+            input_dim=dimension,
+            bounds=(lower_bounds, upper_bounds),
+            **optimizer_kwargs,
+        )
+
+    return _factory
+
+
 # Registry: method name -> factory builder
 _FACTORY_BUILDERS: Dict[str, Callable[..., OptimizerFactory]] = {
     "diffusion": make_diffusion_factory,
+    "diffusion_v2": make_diffusion_v2_factory,
     "diffusion_bbo": make_diffusion_bbo_factory,
     "cma_es": make_cmaes_factory,
     "tpe": make_tpe_factory,
@@ -526,6 +557,9 @@ class COCOExperimentRunner:
                     if optimizer.verbose:
                         optimizer.set_verbose_log_dir(
                             Path(result_folder) / "verbose_logs"
+                        )
+                        optimizer.set_problem_tag(
+                            f"f{problem.id_function}_d{problem.dimension}_i{problem.id_instance}"
                         )
 
                     # Run the ask / evaluate / tell loop.

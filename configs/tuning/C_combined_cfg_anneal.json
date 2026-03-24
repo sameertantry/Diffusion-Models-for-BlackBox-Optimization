@@ -1,0 +1,71 @@
+{
+    "method": "diffusion_v2",
+    "algorithm_name": "DiffusionV2",
+    "suite_name": "bbob",
+    "suite_instance": "",
+    "suite_options": "dimensions: 2,5,10 instance_indices: 1-2",
+    "budget_multiplier": 1024,
+    "eval_batch_size": 64,
+    "precision": 0.1,
+    "output_folder": "DiffusionV2/tuning-C-combined",
+    "post_process": false,
+
+    "_description": "Config C: Combined conditioning (annealed percentile + diverse batch). Tests within-batch diversity with annealed ambition.",
+    "_grid": {
+        "optimizer.conditioning.low_quantile": [0.30, 0.60],
+        "optimizer.conditioning.high_offset":  [0.05, 0.15],
+        "optimizer.explore_frac":              [0.05, 0.15],
+        "optimizer.rank_temperature":          [0.3, 0.8]
+    },
+    "_grid_notes": "low_quantile: how broad the within-batch diversity is (0.30=very diverse, 0.60=focused). high_offset: mild extrapolation above the annealed centre. explore_frac: uniform exploration balance. rank_temperature: sharpness of rank weighting (0.3=sharp, 0.8=mild). 2×2×2×2 = 16 runs.",
+
+    "optimizer": {
+        "num_timesteps": 100,
+        "beta_schedule": "squaredcos_cap_v2",
+        "prediction_type": "epsilon",
+        "clip_sample": true,
+        "clip_sample_range": 1.0,
+
+        "noise_pred_arch": "film_resnet",
+        "hidden_dim": 128,
+        "time_embed_dim": 32,
+        "depth": 3,
+
+        "batch_size": 128,
+        "lr_diffusion": 0.0003,
+        "train_steps": 100,
+
+        "elite_per_dim": 100,
+        "elite_min": 64,
+        "elite_filter": {
+            "type": "quality"
+        },
+
+        "explore_frac": 0.05,
+        "explore_anneal": true,
+        "conditioning": {
+            "type": "combined",
+            "p_low": 0.75,
+            "p_high": 0.99,
+            "low_quantile": 0.50,
+            "high_offset": 0.1
+        },
+        "rank_temperature": 0.5,
+        "y_norm_type": "rank",
+
+        "weight_decay": 0.0001,
+        "x_noise_std": 0.01,
+
+        "snr_loss_weighting": true,
+        "snr_gamma": 5.0,
+
+        "ema_decay": -1,
+
+        "reinit_interval": 0,
+        "reinit_train_steps": 200,
+
+        "seed": 42,
+        "min_data_per_dim": 10,
+        "verbose": true
+    }
+}

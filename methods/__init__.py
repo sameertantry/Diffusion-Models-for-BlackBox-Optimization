@@ -8,6 +8,7 @@ from methods.base import BaseOptimizer
 from methods.cma_es import CMAES
 from methods.diffusion import DiffusionOptimizer
 from methods.diffusion_bbo import DiffusionBBO
+from methods.diffusion_v2 import DiffusionOptimizerV2
 from methods.reinforce import REINFORCE
 from methods.tpe import TPE
 
@@ -17,5 +18,6 @@ __all__ = [
     "CMAES",
     "DiffusionOptimizer",
     "DiffusionBBO",
+    "DiffusionOptimizerV2",
     "REINFORCE",
 ]
