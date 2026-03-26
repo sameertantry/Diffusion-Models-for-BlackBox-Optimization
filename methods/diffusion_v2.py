@@ -65,8 +65,10 @@ from __future__ import annotations
 
 import copy
 import csv
+import hashlib
 import math
 import time
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -91,6 +93,8 @@ from diffusers import DDPMScheduler
 _ELITE_FILTER_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "quality": {},
     "quality_knn": {"k": 5, "diversity_weight": 0.5},
+    "crowding": {"n_tiers": 10},
+    "grid": {"cells_per_dim": 5},
 }
 
 # ------------------------------------------------------------------ #
@@ -117,6 +121,60 @@ _CONDITIONING_DEFAULTS: Dict[str, Dict[str, Any]] = {
         "high_offset": 0.1,
     },
 }
+
+# ------------------------------------------------------------------ #
+# Preconditioning defaults                                             #
+# ------------------------------------------------------------------ #
+_PRECONDITION_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "none": {},
+    "standardize": {},
+    "whiten": {},
+    "whiten_shrink": {},
+    "whiten_ema": {"ema_rate": 0.1},
+}
+
+# ------------------------------------------------------------------ #
+# Exploration strategy defaults                                        #
+# ------------------------------------------------------------------ #
+_EXPLORATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "uniform": {},
+    "sobol": {},
+    "lhs": {},
+}
+
+
+# ------------------------------------------------------------------ #
+# Ledoit-Wolf analytical shrinkage                                     #
+# ------------------------------------------------------------------ #
+
+def _ledoit_wolf_shrinkage(X: np.ndarray) -> np.ndarray:
+    """Ledoit-Wolf shrinkage covariance estimator toward scaled identity.
+
+    Parameters
+    ----------
+    X : np.ndarray, shape (n, d)
+        Mean-centred data matrix.
+
+    Returns
+    -------
+    np.ndarray, shape (d, d)
+        Well-conditioned covariance estimate.
+    """
+    n, d = X.shape
+    if n < 2:
+        return np.eye(d, dtype=np.float64)
+    S = X.T @ X / n  # biased sample covariance
+    trace_S = np.trace(S)
+    mu = trace_S / d
+
+    delta = np.sum((S - mu * np.eye(d)) ** 2) / d
+    X2 = X ** 2
+    beta_raw = np.sum(np.sum(X2.T @ X2, axis=None)) / (n ** 2) - np.sum(S ** 2)
+    beta_raw /= d
+    beta = min(beta_raw, delta)
+    alpha = beta / (delta + 1e-12)
+    alpha = max(0.0, min(alpha, 1.0))
+    return (1.0 - alpha) * S + alpha * mu * np.eye(d)
 
 class DiffusionOptimizerV2(BaseOptimizer):
     """Diffusion-based optimizer with elite buffer (v2).
@@ -312,12 +370,15 @@ class DiffusionOptimizerV2(BaseOptimizer):
         elite_per_dim: int = 10,
         elite_min: int = 64,
         elite_filter: Optional[Dict[str, Any]] = None,
+        elite_adaptive: Optional[Dict[str, Any]] = None,
         guidance_strength: float = 1.0,
         use_regressor: bool = False,
         explore_frac: float = 0.05,
         conditioning_optimism: float = 0.1,
         conditioning_spread: float = 0.3,
         conditioning: Optional[Dict[str, Any]] = None,
+        precondition: Optional[Dict[str, Any]] = None,
+        exploration: Optional[Dict[str, Any]] = None,
         rank_temperature: float = 0.5,
         weight_decay: float = 1e-4,
         x_noise_std: float = 0.01,
@@ -370,6 +431,41 @@ class DiffusionOptimizerV2(BaseOptimizer):
             )
         merged: Dict[str, Any] = {**_ELITE_FILTER_DEFAULTS[ftype], **elite_filter}
         self.elite_filter: Dict[str, Any] = merged
+
+        # Resolve adaptive elite config
+        self.elite_adaptive: Optional[Dict[str, Any]] = elite_adaptive
+        self._elite_floor: float = -np.inf
+        self._elite_max_init: int = self.elite_size
+
+        # Resolve preconditioning config
+        if precondition is None:
+            precondition = {"type": "none"}
+        ptype = precondition.get("type", "none")
+        if ptype not in _PRECONDITION_DEFAULTS:
+            raise ValueError(
+                f"Unknown precondition type {ptype!r}. "
+                f"Supported: {list(_PRECONDITION_DEFAULTS)}"
+            )
+        self.precondition: Dict[str, Any] = {
+            **_PRECONDITION_DEFAULTS[ptype], **precondition,
+        }
+        self._pc_mean: Optional[np.ndarray] = None
+        self._pc_transform: Optional[np.ndarray] = None
+        self._pc_inverse: Optional[np.ndarray] = None
+        self._pc_cov_ema: Optional[np.ndarray] = None
+
+        # Resolve exploration strategy config
+        if exploration is None:
+            exploration = {"type": "uniform"}
+        etype = exploration.get("type", "uniform")
+        if etype not in _EXPLORATION_DEFAULTS:
+            raise ValueError(
+                f"Unknown exploration type {etype!r}. "
+                f"Supported: {list(_EXPLORATION_DEFAULTS)}"
+            )
+        self.exploration: Dict[str, Any] = {
+            **_EXPLORATION_DEFAULTS[etype], **exploration,
+        }
 
         # Resolve conditioning strategy config
         if conditioning is None:
@@ -449,6 +545,14 @@ class DiffusionOptimizerV2(BaseOptimizer):
                 self.regressor.parameters(), lr=lr_regressor, weight_decay=weight_decay,
             )
 
+        # ---- exploration engine (Sobol) -----------------------------------------
+        self._sobol_engine: Optional[Any] = None
+        if self.exploration["type"] == "sobol":
+            from scipy.stats.qmc import Sobol
+            self._sobol_engine = Sobol(
+                d=input_dim, scramble=True, seed=int(seed),
+            )
+
         # ---- data buffers (elite buffer) --------------------------------------
         self.x_data: List[np.ndarray] = []
         self.y_data: List[float] = []
@@ -478,12 +582,16 @@ class DiffusionOptimizerV2(BaseOptimizer):
     def _min_data_count(self) -> int:
         """Absolute number of points required before training starts."""
         if self.min_data_per_dim is not None:
-            return max(1, self.min_data_per_dim * self.input_dim)
-        if self.min_data_frac > 1.0:
-            return int(self.min_data_frac)
+            base = max(1, self.min_data_per_dim * self.input_dim)
+        elif self.min_data_frac > 1.0:
+            base = int(self.min_data_frac)
+        elif self.budget is not None and self.budget > 0:
+            base = max(1, int(self.min_data_frac * self.budget))
+        else:
+            base = max(1, int(self.min_data_frac * 1000))
         if self.budget is not None and self.budget > 0:
-            return max(1, int(self.min_data_frac * self.budget))
-        return max(1, int(self.min_data_frac * 1000))
+            base = min(base, max(1, int(0.1 * self.budget)))
+        return base
 
     # -- normalisation ------------------------------------------------- #
 
@@ -512,6 +620,98 @@ class DiffusionOptimizerV2(BaseOptimizer):
             return
         self.y_mean = float(np.mean(finite))
         self.y_std = float(np.std(finite) + 1e-8)
+
+    # -- x-space preconditioning --------------------------------------- #
+
+    def _update_precondition(self) -> None:
+        """Recompute the preconditioning transform from the elite buffer."""
+        ptype = self.precondition["type"]
+        if ptype == "none":
+            return
+        if len(self.x_data) < 2:
+            return
+
+        x_arr = np.array(self.x_data, dtype=np.float64)
+        x_norm = self._normalize_x(x_arr)
+        n, d = x_norm.shape
+        mean = np.mean(x_norm, axis=0)
+        x_c = x_norm - mean
+
+        if ptype == "standardize":
+            std = np.std(x_c, axis=0) + 1e-8
+            self._pc_mean = mean
+            self._pc_transform = np.diag(1.0 / std)
+            self._pc_inverse = np.diag(std)
+            return
+
+        if n <= d and ptype == "whiten":
+            warnings.warn(
+                f"precondition='whiten' with n={n} <= d={d}; "
+                f"falling back to 'standardize'.",
+                stacklevel=2,
+            )
+            std = np.std(x_c, axis=0) + 1e-8
+            self._pc_mean = mean
+            self._pc_transform = np.diag(1.0 / std)
+            self._pc_inverse = np.diag(std)
+            return
+
+        if ptype == "whiten":
+            cov = x_c.T @ x_c / n
+        elif ptype in ("whiten_shrink", "whiten_ema"):
+            cov = _ledoit_wolf_shrinkage(x_c)
+        else:
+            return
+
+        if ptype == "whiten_ema":
+            eta = float(self.precondition.get("ema_rate", 0.1))
+            if self._pc_cov_ema is None:
+                self._pc_cov_ema = cov
+            else:
+                self._pc_cov_ema = (1.0 - eta) * self._pc_cov_ema + eta * cov
+            cov = self._pc_cov_ema.copy()
+
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.maximum(eigvals, 1e-8)
+        inv_sqrt = np.diag(1.0 / np.sqrt(eigvals))
+        sqrt_diag = np.diag(np.sqrt(eigvals))
+        self._pc_mean = mean
+        self._pc_transform = inv_sqrt @ eigvecs.T   # (d, d)
+        self._pc_inverse = eigvecs @ sqrt_diag       # (d, d)
+
+    def _precondition_x(self, x_norm: np.ndarray) -> np.ndarray:
+        """Apply preconditioning: box-normalised x -> preconditioned z."""
+        if self._pc_transform is None:
+            return x_norm
+        return (x_norm - self._pc_mean) @ self._pc_transform.T
+
+    def _unprecondition_x(self, z: np.ndarray) -> np.ndarray:
+        """Inverse preconditioning: preconditioned z -> box-normalised x."""
+        if self._pc_inverse is None:
+            return z
+        return z @ self._pc_inverse.T + self._pc_mean
+
+    # -- initial exploration ------------------------------------------- #
+
+    def _sample_initial(self, n: int) -> np.ndarray:
+        """Generate space-filling initial samples before training starts."""
+        etype = self.exploration["type"]
+
+        if etype == "sobol" and self._sobol_engine is not None:
+            raw = self._sobol_engine.random(n)
+            return (self.lower + raw * (self.upper - self.lower)).astype(
+                np.float32
+            )
+
+        if etype == "lhs":
+            from scipy.stats.qmc import LatinHypercube
+            sampler = LatinHypercube(d=self.input_dim, seed=self.rng)
+            raw = sampler.random(n)
+            return (self.lower + raw * (self.upper - self.lower)).astype(
+                np.float32
+            )
+
+        return self._sample_uniform(n)
 
     # -- elite buffer management --------------------------------------- #
 
@@ -560,23 +760,141 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
             x_arr = np.array(self.x_data, dtype=np.float32)
             x_norm = self._normalize_x(x_arr)
+            x_pc = self._precondition_x(x_norm)
 
-            # Min–max normalise y to [0, 1]
             y_min, y_max = y_arr.min(), y_arr.max()
             y_01 = (y_arr - y_min) / (y_max - y_min + 1e-12)
 
-            # Mean k-NN distance, then min–max normalise to [0, 1]
-            diversity = self._knn_mean_distances(x_norm, k)
+            diversity = self._knn_mean_distances(x_pc, k)
             d_min, d_max = diversity.min(), diversity.max()
             d_01 = (diversity - d_min) / (d_max - d_min + 1e-12)
 
             return y_01 + dw * d_01
 
+        if ftype == "crowding":
+            n_tiers: int = int(self.elite_filter.get("n_tiers", 10))
+            n = len(y_arr)
+            x_arr = np.array(self.x_data, dtype=np.float32)
+            x_norm = self._normalize_x(x_arr)
+            x_pc = self._precondition_x(x_norm)
+
+            rank_order = np.argsort(-y_arr)
+            tier_ids = np.zeros(n, dtype=np.int64)
+            pts_per_tier = max(1, n // n_tiers)
+            for i, idx in enumerate(rank_order):
+                tier_ids[idx] = i // pts_per_tier
+
+            crowding = np.zeros(n, dtype=np.float64)
+            d = x_pc.shape[1]
+            for dim in range(d):
+                sorted_idx = np.argsort(x_pc[:, dim])
+                crowding[sorted_idx[0]] += 1e12
+                crowding[sorted_idx[-1]] += 1e12
+                span = x_pc[sorted_idx[-1], dim] - x_pc[sorted_idx[0], dim]
+                if span < 1e-12:
+                    continue
+                for j in range(1, n - 1):
+                    crowding[sorted_idx[j]] += (
+                        x_pc[sorted_idx[j + 1], dim]
+                        - x_pc[sorted_idx[j - 1], dim]
+                    ) / span
+
+            cd_min, cd_max = crowding.min(), crowding.max()
+            cd_01 = (crowding - cd_min) / (cd_max - cd_min + 1e-12)
+            max_tier = tier_ids.max() + 1
+            score = (max_tier - tier_ids).astype(np.float64) * (cd_01.max() + 1.0) + cd_01
+            return score
+
+        if ftype == "grid":
+            cells_per_dim: int = int(self.elite_filter.get("cells_per_dim", 5))
+            n = len(y_arr)
+            x_arr = np.array(self.x_data, dtype=np.float32)
+            x_norm = self._normalize_x(x_arr)
+            d = x_norm.shape[1]
+
+            cell_idx = np.clip(
+                np.floor((x_norm + 1.0) / 2.0 * cells_per_dim).astype(np.int64),
+                0,
+                cells_per_dim - 1,
+            )
+
+            if d <= 5:
+                mults = np.array(
+                    [cells_per_dim ** i for i in range(d)], dtype=np.int64
+                )
+                cell_keys = cell_idx @ mults
+            else:
+                cell_keys = np.array([
+                    int(hashlib.md5(row.tobytes()).hexdigest(), 16)
+                    % (self.elite_size * 2)
+                    for row in cell_idx
+                ], dtype=np.int64)
+
+            scores = np.full(n, -1e18, dtype=np.float64)
+            cell_best: Dict[int, Tuple[int, float]] = {}
+            for i in range(n):
+                ck = int(cell_keys[i])
+                yv = float(y_arr[i])
+                if ck not in cell_best or yv > cell_best[ck][1]:
+                    cell_best[ck] = (i, yv)
+
+            for _ck, (idx, yv) in cell_best.items():
+                scores[idx] = yv + 1e12
+
+            for i in range(n):
+                if scores[i] < 0:
+                    scores[i] = y_arr[i]
+
+            return scores
+
         raise ValueError(f"Unknown elite_filter type: {ftype!r}")
 
     def _update_elite(self) -> None:
-        """Evict lowest-scoring points if buffer exceeds *elite_size*."""
+        """Evict lowest-scoring points if buffer exceeds the target size.
+
+        When ``elite_adaptive`` is enabled, the target size shrinks
+        linearly from ``_elite_max_init`` to ``elite_min`` over the
+        optimisation budget (LSHADE-style), and a soft quality floor
+        prevents the buffer from retaining very poor points.
+        """
         n = len(self.y_data)
+
+        if self.elite_adaptive and self.elite_adaptive.get("enabled"):
+            progress = self._optimization_progress
+            elite_cap = self._elite_max_init - int(
+                (self._elite_max_init - self.elite_min) * progress
+            )
+            elite_cap = max(elite_cap, self.elite_min)
+
+            delta = float(self.elite_adaptive.get("floor_decay", 0.01))
+            p = float(self.elite_adaptive.get("floor_percentile", 5))
+            y_arr = np.array(self.y_data, dtype=np.float64)
+            pct_val = float(np.percentile(y_arr, p))
+            self._elite_floor = max(
+                self._elite_floor * (1.0 - delta),
+                pct_val,
+            )
+
+            above = [
+                i for i, yv in enumerate(self.y_data) if yv >= self._elite_floor
+            ]
+            if len(above) < self.elite_min:
+                above = list(range(n))
+
+            if len(above) > elite_cap:
+                sub_scores = self._compute_elite_scores()
+                sub_scores_above = np.array([sub_scores[i] for i in above])
+                keep_count = elite_cap
+                top_local = np.argpartition(sub_scores_above, -keep_count)[-keep_count:]
+                keep_idx = [above[j] for j in top_local]
+            else:
+                keep_idx = above
+
+            if len(keep_idx) < n:
+                self.x_data = [self.x_data[i] for i in keep_idx]
+                self.y_data = [self.y_data[i] for i in keep_idx]
+            return
+
         if n <= self.elite_size:
             return
         scores = self._compute_elite_scores()
@@ -902,9 +1220,9 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
     def ask(self, n: int = 1) -> np.ndarray:
         if len(self.x_data) < self._min_data_count:
-            x_uniform = self._sample_uniform(n)
-            self._register_asked(x_uniform)
-            return x_uniform
+            x_init = self._sample_initial(n)
+            self._register_asked(x_init)
+            return x_init
 
         if self.explore_anneal:
             progress = self._optimization_progress
@@ -949,8 +1267,8 @@ class DiffusionOptimizerV2(BaseOptimizer):
                     scheduler_output = scheduler.step(eps_guided, int(t), x_t)
                     x_t = scheduler_output.prev_sample
 
-            # Denormalize from [-1, 1] → original domain
-            x_np_norm = x_t.detach().cpu().numpy().astype(np.float32)
+            x_np_pc = x_t.detach().cpu().numpy().astype(np.float64)
+            x_np_norm = self._unprecondition_x(x_np_pc).astype(np.float32)
             x_np = self._denormalize_x(x_np_norm)
             x_np = np.clip(x_np, self.lower, self.upper)
 
@@ -995,6 +1313,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         # Evict worst points, then update stats
         self._update_elite()
         self._update_normalization()
+        self._update_precondition()
 
         # Periodic reinitialisation
         do_reinit = (
@@ -1017,6 +1336,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
             return
 
         x_norm = self._normalize_x(x_arr)
+        x_pc = self._precondition_x(x_norm.astype(np.float64)).astype(np.float32)
 
         if self.y_norm_type == "rank":
             n_pts = len(y_arr)
@@ -1027,10 +1347,29 @@ class DiffusionOptimizerV2(BaseOptimizer):
                 ranks = np.empty(n_pts, dtype=np.float32)
                 ranks[order] = np.arange(n_pts, dtype=np.float32)
                 y_normalized = ranks / (n_pts - 1)
+
+            if self.conditioning.get("aug", False) and n_pts > 1:
+                ctype = self.conditioning["type"]
+                if ctype == "optimistic":
+                    alpha = float(self.conditioning.get("optimism", 0.1))
+                elif ctype == "percentile_annealing":
+                    alpha = 1.0 - float(self.conditioning.get("p_high", 0.99))
+                elif ctype in ("diverse_batch", "combined"):
+                    alpha = float(self.conditioning.get("high_offset", 0.1))
+                else:
+                    alpha = 0.1
+                alpha = max(alpha, 0.05)
+                top_mask = y_normalized >= 0.8
+                n_top = int(top_mask.sum())
+                if n_top > 0:
+                    noise = self.rng.uniform(0.0, alpha, size=n_top).astype(
+                        np.float32
+                    )
+                    y_normalized[top_mask] = y_normalized[top_mask] + noise
         else:
             y_normalized = self._normalize_y(y_arr)
 
-        x_train = _to_tensor(x_norm, self.device)
+        x_train = _to_tensor(x_pc, self.device)
         y_train = _to_tensor(y_normalized, self.device)
 
         weights = self._compute_rank_weights(y_arr)
@@ -1126,6 +1465,19 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.y_std = 1.0
         self.best_y = -np.inf
         self.best_x = None
+
+        self._pc_mean = None
+        self._pc_transform = None
+        self._pc_inverse = None
+        self._pc_cov_ema = None
+
+        self._elite_floor = -np.inf
+
+        if self.exploration["type"] == "sobol":
+            from scipy.stats.qmc import Sobol
+            self._sobol_engine = Sobol(
+                d=self.input_dim, scramble=True, seed=42,
+            )
 
         self._reinit_model()
         self._reset_verbose_trace()

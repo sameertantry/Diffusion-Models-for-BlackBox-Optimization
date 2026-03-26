@@ -7,8 +7,16 @@
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "DiffusionV2/model-scale-tuning",
+    "output_folder": "DiffusionV2/tuning-elite-adaptive",
     "post_process": false,
+
+    "_description": "Compare adaptive elite sizing: disabled vs enabled with different floor_decay",
+    "_grid": {
+        "optimizer.elite_adaptive.enabled": [false, true],
+        "optimizer.elite_adaptive.floor_decay": [0.005, 0.02]
+    },
+    "_grid_notes": "4 runs (2x2; enabled=false ignores floor_decay but grid still produces the combo). Fixed: whiten_shrink, sobol, quality elite, percentile_annealing.",
+
     "optimizer": {
         "num_timesteps": 100,
         "beta_schedule": "squaredcos_cap_v2",
@@ -30,21 +38,26 @@
         "elite_filter": {
             "type": "quality"
         },
-        "elite_adaptive": null,
+        "elite_adaptive": {
+            "enabled": false,
+            "floor_decay": 0.01,
+            "floor_percentile": 5
+        },
 
         "precondition": {
-            "type": "none"
+            "type": "whiten_shrink"
         },
         "exploration": {
-            "type": "uniform"
+            "type": "sobol"
         },
 
         "explore_frac": 0.05,
         "explore_anneal": true,
         "conditioning": {
-            "type": "optimistic",
-            "optimism": 0.1,
-            "spread": 0.3,
+            "type": "percentile_annealing",
+            "p_low": 0.75,
+            "p_high": 0.99,
+            "spread": 0.0,
             "aug": false
         },
         "rank_temperature": 0.5,

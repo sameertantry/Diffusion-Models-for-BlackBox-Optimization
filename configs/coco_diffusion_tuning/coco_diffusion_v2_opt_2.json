@@ -7,8 +7,11 @@
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "DiffusionV2/model-scale-tuning",
+    "output_folder": "DiffusionV2/opt-2-diverse",
     "post_process": false,
+
+    "_description": "Opt-2: Diverse — EMA whitening, Sobol init, crowding elite with adaptive sizing, diverse batch conditioning with augmentation",
+
     "optimizer": {
         "num_timesteps": 100,
         "beta_schedule": "squaredcos_cap_v2",
@@ -28,24 +31,30 @@
         "elite_per_dim": 100,
         "elite_min": 64,
         "elite_filter": {
-            "type": "quality"
+            "type": "crowding",
+            "n_tiers": 10
         },
-        "elite_adaptive": null,
+        "elite_adaptive": {
+            "enabled": true,
+            "floor_decay": 0.02,
+            "floor_percentile": 5
+        },
 
         "precondition": {
-            "type": "none"
+            "type": "whiten_ema",
+            "ema_rate": 0.1
         },
         "exploration": {
-            "type": "uniform"
+            "type": "sobol"
         },
 
         "explore_frac": 0.05,
         "explore_anneal": true,
         "conditioning": {
-            "type": "optimistic",
-            "optimism": 0.1,
-            "spread": 0.3,
-            "aug": false
+            "type": "diverse_batch",
+            "low_percentile": 0.5,
+            "high_offset": 0.1,
+            "aug": true
         },
         "rank_temperature": 0.5,
         "y_norm_type": "rank",

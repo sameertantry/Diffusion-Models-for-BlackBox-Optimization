@@ -40,6 +40,9 @@
         "elite_filter": {
             "type": "quality"
         },
+        "elite_adaptive": null,
+        "precondition": {"type": "none"},
+        "exploration": {"type": "uniform"},
 
         "explore_frac": 0.05,
         "explore_anneal": true,
@@ -48,7 +51,8 @@
             "p_low": 0.75,
             "p_high": 0.99,
             "low_quantile": 0.50,
-            "high_offset": 0.1
+            "high_offset": 0.1,
+            "aug": false
         },
         "rank_temperature": 0.5,
         "y_norm_type": "rank",

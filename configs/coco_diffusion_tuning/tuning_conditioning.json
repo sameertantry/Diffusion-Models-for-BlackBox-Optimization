@@ -7,8 +7,16 @@
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "DiffusionV2/model-scale-tuning",
+    "output_folder": "DiffusionV2/tuning-conditioning",
     "post_process": false,
+
+    "_description": "Compare all 4 conditioning types with and without augmentation",
+    "_grid": {
+        "optimizer.conditioning.type": ["optimistic", "percentile_annealing", "diverse_batch", "combined"],
+        "optimizer.conditioning.aug": [false, true]
+    },
+    "_grid_notes": "8 runs (4x2). Fixed: whiten_shrink, sobol, quality elite. Each conditioning type uses its defaults plus the grid overrides.",
+
     "optimizer": {
         "num_timesteps": 100,
         "beta_schedule": "squaredcos_cap_v2",
@@ -33,10 +41,10 @@
         "elite_adaptive": null,
 
         "precondition": {
-            "type": "none"
+            "type": "whiten_shrink"
         },
         "exploration": {
-            "type": "uniform"
+            "type": "sobol"
         },
 
         "explore_frac": 0.05,

@@ -7,8 +7,17 @@
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "DiffusionV2/model-scale-tuning",
+    "output_folder": "DiffusionV2/tuning-combined-best",
     "post_process": false,
+
+    "_description": "Cross top picks: preconditioning x conditioning x rank_temperature",
+    "_grid": {
+        "optimizer.precondition.type": ["whiten_shrink", "whiten_ema"],
+        "optimizer.conditioning.type": ["percentile_annealing", "diverse_batch"],
+        "optimizer.rank_temperature": [0.3, 0.5, 0.8]
+    },
+    "_grid_notes": "12 runs (2x2x3). All use sobol, quality elite, adaptive elite, augmentation. Covers the most promising combinations from isolated experiments.",
+
     "optimizer": {
         "num_timesteps": 100,
         "beta_schedule": "squaredcos_cap_v2",
@@ -30,22 +39,27 @@
         "elite_filter": {
             "type": "quality"
         },
-        "elite_adaptive": null,
+        "elite_adaptive": {
+            "enabled": true,
+            "floor_decay": 0.01,
+            "floor_percentile": 5
+        },
 
         "precondition": {
-            "type": "none"
+            "type": "whiten_shrink"
         },
         "exploration": {
-            "type": "uniform"
+            "type": "sobol"
         },
 
         "explore_frac": 0.05,
         "explore_anneal": true,
         "conditioning": {
-            "type": "optimistic",
-            "optimism": 0.1,
-            "spread": 0.3,
-            "aug": false
+            "type": "percentile_annealing",
+            "p_low": 0.75,
+            "p_high": 0.99,
+            "spread": 0.0,
+            "aug": true
         },
         "rank_temperature": 0.5,
         "y_norm_type": "rank",

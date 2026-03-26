@@ -7,8 +7,15 @@
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "DiffusionV2/model-scale-tuning",
+    "output_folder": "DiffusionV2/tuning-precondition",
     "post_process": false,
+
+    "_description": "Isolate preconditioning effect: compare none / standardize / whiten_shrink / whiten_ema",
+    "_grid": {
+        "optimizer.precondition.type": ["none", "standardize", "whiten_shrink", "whiten_ema"]
+    },
+    "_grid_notes": "4 runs. Fixed: sobol exploration, quality elite, percentile_annealing conditioning.",
+
     "optimizer": {
         "num_timesteps": 100,
         "beta_schedule": "squaredcos_cap_v2",
@@ -36,15 +43,16 @@
             "type": "none"
         },
         "exploration": {
-            "type": "uniform"
+            "type": "sobol"
         },
 
         "explore_frac": 0.05,
         "explore_anneal": true,
         "conditioning": {
-            "type": "optimistic",
-            "optimism": 0.1,
-            "spread": 0.3,
+            "type": "percentile_annealing",
+            "p_low": 0.75,
+            "p_high": 0.99,
+            "spread": 0.0,
             "aug": false
         },
         "rank_temperature": 0.5,
