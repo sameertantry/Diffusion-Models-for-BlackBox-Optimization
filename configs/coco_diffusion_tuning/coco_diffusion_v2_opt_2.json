@@ -28,8 +28,8 @@
         "lr_diffusion": 0.0003,
         "train_steps": 100,
 
-        "elite_per_dim": 100,
-        "elite_min": 64,
+        "elite_min_per_dim": 5,
+        "elite_max_per_dim": 100,
         "elite_filter": {
             "type": "crowding",
             "n_tiers": 10

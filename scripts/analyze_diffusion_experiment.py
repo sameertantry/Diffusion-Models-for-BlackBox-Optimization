@@ -720,7 +720,7 @@ def build_text_report(
     opt = config.get("optimizer", config)
     for k in ["num_timesteps", "beta_schedule", "prediction_type", "clip_sample",
               "hidden_dim", "depth", "batch_size", "lr_diffusion", "train_steps",
-              "elite_per_dim", "elite_min", "explore_frac", "rank_temperature",
+              "elite_min_per_dim", "elite_max_per_dim", "explore_frac", "rank_temperature",
               "x_noise_std", "p_uncond", "cfg_scale", "ema_decay", "min_data",
               "conditioning", "noise_pred_arch"]:
         if k in opt:
@@ -835,13 +835,17 @@ def build_text_report(
     lines.append("ELITE BUFFER ANALYSIS")
     lines.append("-" * 40)
     opt_cfg = config.get("optimizer", config)
-    elite_per_dim = opt_cfg.get("elite_per_dim", "?")
-    elite_min = opt_cfg.get("elite_min", "?")
+    elite_min_per_dim = opt_cfg.get("elite_min_per_dim", opt_cfg.get("elite_per_dim", "?"))
+    elite_max_per_dim = opt_cfg.get("elite_max_per_dim", "?")
+    elite_min_val = opt_cfg.get("elite_min", "?")
     budget_mult = config.get("budget_multiplier", 1024)
     batch = config.get("eval_batch_size", 64)
     for dim in dims:
-        if isinstance(elite_per_dim, (int, float)):
-            elite_size = max(int(elite_per_dim) * dim, int(elite_min) if isinstance(elite_min, (int, float)) else 64)
+        if isinstance(elite_max_per_dim, (int, float)):
+            e_min = max(2, int(elite_min_per_dim) * dim) if isinstance(elite_min_per_dim, (int, float)) else 10
+            elite_size = max(e_min, int(elite_max_per_dim) * dim)
+        elif isinstance(elite_min_val, (int, float)):
+            elite_size = max(int(elite_min_val), int(elite_min_per_dim) * dim) if isinstance(elite_min_per_dim, (int, float)) else int(elite_min_val)
         else:
             elite_size = "?"
         budget = budget_mult * dim

@@ -54,9 +54,21 @@ import csv
 import json
 import time
 from pathlib import Path
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+
+# --------------------------------------------------------------------------- #
+# Import path robustness                                                      #
+#                                                                             #
+# Running `python benchmarks/coco_wrapper.py` sets sys.path[0] to `benchmarks/`#
+# which makes top-level imports like `methods.*` fail. We add the repo root to #
+# sys.path so the script works from any working directory.                    #
+# --------------------------------------------------------------------------- #
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 # --------------------------------------------------------------------------- #
 # Lazy import guard: cocoex is only required at runtime.                       #
@@ -310,7 +322,7 @@ def make_diffusion_v2_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
     ----------
     **optimizer_kwargs
         Keyword arguments accepted by :class:`DiffusionOptimizerV2`
-        (e.g. ``elite_per_dim``, ``cfg_scale``, ``ema_decay``).
+        (e.g. ``elite_min_per_dim``, ``elite_max_per_dim``, ``ema_decay``).
 
     Returns
     -------

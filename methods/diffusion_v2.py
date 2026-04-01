@@ -6,9 +6,9 @@ fixed-size elite buffer and several additional improvements.
 
 Changes from :class:`DiffusionOptimizer`
 ----------------------------------------
-1. **Dimension-scaled elite buffer** — only the top ``elite_per_dim × d``
-   evaluated points (by objective value) are retained for training.  This
-   prevents the training distribution from being diluted by mediocre
+1. **Dimension-scaled elite buffer** — the buffer capacity is
+   ``elite_max_per_dim × d`` with a floor of ``elite_min_per_dim × d``.
+   This prevents the training distribution from being diluted by mediocre
    early-exploration data as the total number of evaluations grows.
 
 2. **X-space normalisation** — inputs are mapped to [-1, 1] via the
@@ -209,11 +209,12 @@ class DiffusionOptimizerV2(BaseOptimizer):
         Upper bound on gradient steps per ``tell()`` call.  Actual
         steps are scaled by elite buffer size and may terminate early
         if the loss plateaus.
-    elite_per_dim : int
-        Elite buffer size multiplier.  The actual buffer capacity is
-        ``max(elite_min, elite_per_dim × input_dim)``.
-    elite_min : int
-        Minimum elite buffer capacity regardless of dimensionality.
+    elite_min_per_dim : int
+        Minimum elite buffer size per dimension.  The actual floor is
+        ``max(2, elite_min_per_dim × input_dim)``.
+    elite_max_per_dim : int
+        Maximum elite buffer size per dimension.  The actual capacity is
+        ``max(elite_min, elite_max_per_dim × input_dim)``.
     elite_filter : dict or None
         Strategy used to select which points are kept when the elite
         buffer overflows.  A dict with a mandatory ``"type"`` key and
@@ -367,8 +368,8 @@ class DiffusionOptimizerV2(BaseOptimizer):
         lr_diffusion: float = 3e-4,
         lr_regressor: float = 1e-3,
         train_steps: int = 50,
-        elite_per_dim: int = 10,
-        elite_min: int = 64,
+        elite_min_per_dim: int = 5,
+        elite_max_per_dim: int = 100,
         elite_filter: Optional[Dict[str, Any]] = None,
         elite_adaptive: Optional[Dict[str, Any]] = None,
         guidance_strength: float = 1.0,
@@ -416,9 +417,15 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.num_timesteps = num_timesteps
         self.batch_size = batch_size
         self.train_steps = train_steps
-        self.elite_per_dim = elite_per_dim
-        self.elite_min = elite_min
-        self.elite_size = max(elite_min, elite_per_dim * input_dim)
+        if elite_min_per_dim > elite_max_per_dim:
+            raise ValueError(
+                f"elite_min_per_dim ({elite_min_per_dim}) must be <= "
+                f"elite_max_per_dim ({elite_max_per_dim})"
+            )
+        self.elite_min_per_dim = elite_min_per_dim
+        self.elite_max_per_dim = elite_max_per_dim
+        self.elite_min = max(2, elite_min_per_dim * input_dim)
+        self.elite_size = max(self.elite_min, elite_max_per_dim * input_dim)
 
         # Resolve elite filter config
         if elite_filter is None:
@@ -503,6 +510,9 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.y_norm_type = y_norm_type
         self.min_data_frac = float(min_data)
         self.min_data_per_dim = min_data_per_dim
+
+        self.exploration_stage = True
+
         self.explore_anneal = explore_anneal
         self.snr_loss_weighting = snr_loss_weighting
         self.snr_gamma = snr_gamma
@@ -570,6 +580,8 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self._init_time_embed_dim = time_embed_dim
         self._init_depth = depth
 
+        self._pc_clip_range: float = clip_sample_range
+
         # ---- loss logging ------------------------------------------------------
         self._loss_log_path: Optional[Path] = None
         self._loss_header_written: bool = False
@@ -580,7 +592,13 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
     @property
     def _min_data_count(self) -> int:
-        """Absolute number of points required before training starts."""
+        """Absolute number of points required before training starts.
+
+        Clamped so it never exceeds ``elite_size``.  Without this,
+        elite eviction in ``_update_elite`` would push ``len(x_data)``
+        below the threshold every iteration, causing ``ask()`` to
+        permanently fall back to random exploration.
+        """
         if self.min_data_per_dim is not None:
             base = max(1, self.min_data_per_dim * self.input_dim)
         elif self.min_data_frac > 1.0:
@@ -588,9 +606,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         elif self.budget is not None and self.budget > 0:
             base = max(1, int(self.min_data_frac * self.budget))
         else:
-            base = max(1, int(self.min_data_frac * 1000))
-        if self.budget is not None and self.budget > 0:
-            base = min(base, max(1, int(0.1 * self.budget)))
+            raise ValueError("min_data_frac must be <= 1.0 or budget must be set")
         return base
 
     # -- normalisation ------------------------------------------------- #
@@ -1219,10 +1235,13 @@ class DiffusionOptimizerV2(BaseOptimizer):
     # ------------------------------------------------------------------ #
 
     def ask(self, n: int = 1) -> np.ndarray:
-        if len(self.x_data) < self._min_data_count:
+        if self.exploration_stage:
+            #print("Exploration stage")
             x_init = self._sample_initial(n)
             self._register_asked(x_init)
             return x_init
+
+        #print("Exploitation stage")
 
         if self.explore_anneal:
             progress = self._optimization_progress
@@ -1244,7 +1263,9 @@ class DiffusionOptimizerV2(BaseOptimizer):
             if self.use_regressor and self.regressor is not None:
                 self.regressor.eval()
 
-            scheduler = DDPMScheduler(**self._scheduler_config)
+            inf_cfg = {**self._scheduler_config,
+                       "clip_sample_range": self._pc_clip_range}
+            scheduler = DDPMScheduler(**inf_cfg)
             scheduler.set_timesteps(self.num_timesteps, device=self.device)
 
             x_t = torch.randn(n_exploit, self.input_dim, device=self.device)
@@ -1304,9 +1325,12 @@ class DiffusionOptimizerV2(BaseOptimizer):
                 self.best_y = float(yi)
                 self.best_x = xi.copy()
 
-        if len(self.x_data) < self._min_data_count:
-            self._register_told(x, y_obj, tau=np.nan)
-            return
+        if self.exploration_stage:
+            if len(self.x_data) < self._min_data_count:
+                self._register_told(x, y_obj, tau=np.nan)
+                return
+
+            self.exploration_stage = False
 
         self._tell_count += 1
 
@@ -1337,6 +1361,14 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
         x_norm = self._normalize_x(x_arr)
         x_pc = self._precondition_x(x_norm.astype(np.float64)).astype(np.float32)
+
+        if self._pc_transform is not None:
+            self._pc_clip_range = max(
+                float(self._scheduler_config["clip_sample_range"]),
+                float(np.max(np.abs(x_pc))) + 0.1,
+            )
+        else:
+            self._pc_clip_range = float(self._scheduler_config["clip_sample_range"])
 
         if self.y_norm_type == "rank":
             n_pts = len(y_arr)
@@ -1470,6 +1502,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self._pc_transform = None
         self._pc_inverse = None
         self._pc_cov_ema = None
+        self._pc_clip_range = float(self._scheduler_config["clip_sample_range"])
 
         self._elite_floor = -np.inf
 
