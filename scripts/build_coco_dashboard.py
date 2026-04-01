@@ -69,6 +69,15 @@ class VerboseTrace:
 
 
 @dataclass
+class LossTrace:
+    filename: str
+    title: str
+    function_id: Optional[int]
+    dimension: Optional[int]
+    instance_id: Optional[int]
+
+
+@dataclass
 class Experiment:
     exp_id: str
     name: str
@@ -78,6 +87,7 @@ class Experiment:
     source: str
     records: Dict[Key, Record]
     verbose_traces: List[VerboseTrace] = field(default_factory=list)
+    loss_traces: List[LossTrace] = field(default_factory=list)
 
 
 CSV_NAME = "experiment_results.csv"
@@ -300,6 +310,52 @@ def _scan_verbose_metadata(
     return traces
 
 
+def _scan_loss_metadata(exp_dir: Path) -> List[LossTrace]:
+    """Scan verbose_logs dir for *_losses.csv files — metadata only."""
+    vlog_dir = exp_dir / "verbose_logs"
+    if not vlog_dir.is_dir():
+        return []
+    loss_files = sorted(vlog_dir.glob("*_losses.csv"))
+    if not loss_files:
+        return []
+    traces: List[LossTrace] = []
+    for lf in loss_files:
+        fid, dim, iid = _parse_fdi_from_stem(lf.stem)
+        title = f"f{fid} d{dim} i{iid}" if fid is not None else lf.stem
+        traces.append(LossTrace(
+            filename=lf.name, title=title,
+            function_id=fid, dimension=dim, instance_id=iid,
+        ))
+    return traces
+
+
+def _process_single_loss_csv(csv_path: Path) -> Optional[dict]:
+    """Load a *_losses.csv and return JSON-serialisable dict.
+
+    The CSV has columns: tell_count, step, diffusion_loss.
+    We return all loss values with tell_count as the x-axis
+    (multiple steps per tell_count are kept in order).
+    """
+    if not csv_path.exists():
+        return None
+    tell_counts: List[int] = []
+    losses: List[float] = []
+    try:
+        with csv_path.open("r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                tc = _to_int(row.get("tell_count", ""))
+                loss = _to_float(row.get("diffusion_loss", ""))
+                if tc is not None and loss is not None:
+                    tell_counts.append(tc)
+                    losses.append(round(loss, 6))
+    except Exception:
+        return None
+    if not losses:
+        return None
+    return {"tell_counts": tell_counts, "losses": losses}
+
+
 def _process_single_npz(npz_path: Path) -> Optional[dict]:
     """Load and fully process one .npz file into a JSON-serialisable dict."""
     data = _load_npz_simple(npz_path)
@@ -378,6 +434,7 @@ def load_experiment(exp_dir: Path, project_root: Path, exp_index: int) -> Option
     name = method_name or exp_dir.name
     exp_id = f"exp_{exp_index:04d}"
     verbose_traces = _scan_verbose_metadata(exp_dir, records)
+    loss_traces = _scan_loss_metadata(exp_dir)
     return Experiment(
         exp_id=exp_id,
         name=name,
@@ -387,6 +444,7 @@ def load_experiment(exp_dir: Path, project_root: Path, exp_index: int) -> Option
         source=source,
         records=records,
         verbose_traces=verbose_traces,
+        loss_traces=loss_traces,
     )
 
 
@@ -469,6 +527,19 @@ def to_json_payload(experiments: List[Experiment], preselected_ids: List[str]) -
                     "filename": t.filename,
                 }
                 for t in exp.verbose_traces
+            ]
+        exp_entry["has_losses"] = len(exp.loss_traces) > 0
+        exp_entry["loss_count"] = len(exp.loss_traces)
+        if exp.loss_traces:
+            exp_entry["loss_traces"] = [
+                {
+                    "title": t.title,
+                    "function_id": t.function_id,
+                    "dimension": t.dimension,
+                    "instance_id": t.instance_id,
+                    "filename": t.filename,
+                }
+                for t in exp.loss_traces
             ]
         payload["experiments"].append(exp_entry)
         for rec in exp.records.values():
@@ -1114,6 +1185,19 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
             <div id="plotVerboseSamples" class="chart-area"></div>
           </div>
         </div>
+        <!-- Row 3: training loss (shown only when data exists) -->
+        <div class="chart-grid" id="verboseLossRow" style="display:none;">
+          <div class="chart-card" style="grid-column: 1 / -1;">
+            <div class="chart-card-header">
+              <h3>Diffusion Training Loss</h3>
+              <div class="chart-card-actions">
+                <button class="btn btn-icon" title="Info" data-info="lossLogs">?</button>
+                <button class="btn btn-icon" title="Save" data-export-plot="plotVerboseLoss">&#128190;</button>
+              </div>
+            </div>
+            <div id="plotVerboseLoss" class="chart-area"></div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1314,6 +1398,10 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       verboseSamplesImprovement: {
         en: { title: 'Samples per Iteration & Best-Value Drop', body: '<p>Combines the batch size with the <em>improvement signal</em> to show whether adding more evaluations actually helps.</p><h4>Axes</h4><ul style="padding-left:18px;"><li><strong>X-axis — Iteration:</strong> the iteration index.</li><li><strong>Left Y-axis — samples (bars):</strong> the number of candidate solutions generated and evaluated in this iteration (batch size). May vary between iterations if the optimizer uses an adaptive batch scheme.</li><li><strong>Right Y-axis — best-value drop (line):</strong> calculated as <code>iter_best[i−1] − iter_best[i]</code>, i.e. how much the per-iteration best improved compared to the previous iteration. Positive values mean the optimizer found a <em>better</em> solution than before; zero means no progress; negative values (rare) mean the best in this batch was worse than the previous batch\'s best (note: the <em>running</em> best still cannot increase).</li></ul><h4>What to look for</h4><ul style="padding-left:18px;"><li><strong>Large bars + positive drop:</strong> the optimizer is using many samples productively — good exploration.</li><li><strong>Large bars + zero drop:</strong> spending evaluations without progress — budget is being wasted.</li><li><strong>Drop spikes:</strong> iterations where a significant breakthrough happened. Useful for identifying when the optimizer discovered a new promising basin.</li><li><strong>Drop near zero everywhere:</strong> the optimizer converged (or stalled) very early.</li></ul>' },
         ru: { title: 'Сэмплы за итерацию и падение лучшего значения', body: '<p>Объединяет размер пакета с <em>сигналом улучшения</em>, показывая, приносят ли дополнительные вычисления пользу.</p><h4>Оси</h4><ul style="padding-left:18px;"><li><strong>X — Итерация:</strong> индекс итерации.</li><li><strong>Левая Y — samples (столбцы):</strong> число сгенерированных и оценённых кандидатов в этой итерации (размер пакета). Может меняться между итерациями при адаптивной схеме.</li><li><strong>Правая Y — падение лучшего значения (линия):</strong> вычисляется как <code>iter_best[i−1] − iter_best[i]</code>, т.е. насколько лучший результат итерации улучшился по сравнению с предыдущей. Положительные значения — оптимизатор нашёл <em>лучшее</em> решение; ноль — прогресса нет.</li></ul><h4>На что обратить внимание</h4><ul style="padding-left:18px;"><li><strong>Большие столбцы + положительное падение:</strong> оптимизатор продуктивно использует сэмплы.</li><li><strong>Большие столбцы + нулевое падение:</strong> бюджет тратится без прогресса.</li><li><strong>Пики падения:</strong> итерации с прорывом — оптимизатор обнаружил новый бассейн.</li><li><strong>Падение около нуля везде:</strong> оптимизатор сошёлся (или застрял) очень рано.</li></ul>' }
+      },
+      lossLogs: {
+        en: { title: 'Training Loss (Verbose Logs)', body: '<p>Shows the <strong>diffusion model training loss</strong> recorded during the optimization run. Not all experiments record training losses — this section appears only when <code>*_losses.csv</code> files are present.</p><h4>Axes</h4><ul style="padding-left:18px;"><li><strong>X-axis — tell_count:</strong> the optimizer iteration (tell step). Multiple gradient update steps happen within a single tell_count, so you will see several loss values per tell_count value.</li><li><strong>Y-axis — Diffusion loss:</strong> the training loss of the diffusion model at each gradient step.</li></ul><h4>What to look for</h4><ul style="padding-left:18px;"><li><strong>Loss decreasing within each tell_count:</strong> the model is learning from the current batch of elite samples.</li><li><strong>Loss spikes at new tell_count values:</strong> expected when the training data distribution shifts as new samples arrive.</li><li><strong>Overall trend:</strong> generally, loss should decrease or stabilize over the course of optimization.</li></ul>' },
+        ru: { title: 'Лосс обучения (Verbose Logs)', body: '<p>Показывает <strong>лосс обучения диффузионной модели</strong>, записанный в ходе оптимизации. Не все эксперименты записывают лосс обучения — этот раздел появляется только при наличии файлов <code>*_losses.csv</code>.</p><h4>Оси</h4><ul style="padding-left:18px;"><li><strong>X — tell_count:</strong> итерация оптимизатора (шаг tell). В рамках одного tell_count выполняется несколько шагов градиентного обновления, поэтому для каждого значения tell_count будет несколько значений лосса.</li><li><strong>Y — Diffusion loss:</strong> значение лосса диффузионной модели на каждом шаге обучения.</li></ul><h4>На что обратить внимание</h4><ul style="padding-left:18px;"><li><strong>Лосс уменьшается внутри tell_count:</strong> модель учится на текущем пакете элитных сэмплов.</li><li><strong>Скачки лосса на новых tell_count:</strong> ожидаемо при смене распределения обучающих данных.</li><li><strong>Общий тренд:</strong> в целом лосс должен уменьшаться или стабилизироваться.</li></ul>' }
       },
       bbobGroups: {
         en: { title: 'BBOB Function Groups', body: '<p>The 24 BBOB (Black-Box Optimization Benchmarking) functions are organised into 5 groups by their <strong>landscape properties</strong>. Understanding these groups helps interpret why certain optimizers excel or struggle on specific functions.</p><h4>1. Separable (f1–f5)</h4><p>Each variable can be optimised independently — there are no interactions between dimensions. The global optimum is found by solving <em>D</em> independent 1-D problems. Easy for coordinate-wise methods; functions include Sphere, Ellipsoidal, Rastrigin (separable), Büche-Rastrigin, Linear slope.</p><h4>2. Low/moderate conditioning (f6–f9)</h4><p>Unimodal with moderate ill-conditioning (condition number ~10–1000). Variables interact, but there is a single funnel toward the optimum. Tests basic covariance adaptation and step-size control. Functions: Attractive sector, Step-ellipsoidal, Rosenbrock (original & rotated).</p><h4>3. High conditioning & unimodal (f10–f14)</h4><p>Unimodal with <strong>very high</strong> ill-conditioning (condition number up to 10⁶). The landscape is a single extremely stretched valley — naive search gets trapped on narrow ridges. Tests efficient learning of the full covariance structure. Functions: Ellipsoidal (high-cond), Discus, Bent cigar, Sharp ridge, Different powers.</p><h4>4. Multi-modal — adequate structure (f15–f19)</h4><p>Multiple local optima, but the landscape retains gradients that guide well-tuned search toward the best basin. Tests the exploration/exploitation balance. Functions: Rastrigin (rotated), Weierstrass, Schaffers F7, Schaffers F7 (ill-cond), Griewank-Rosenbrock.</p><h4>5. Multi-modal — weak structure (f20–f24)</h4><p>Many local optima of <em>similar quality</em>; the global optimum has little basin-of-attraction advantage — essentially needle-in-a-haystack. Tests pure exploration capability and robustness to deceptive gradients. Functions: Schwefel, Gallagher 101 peaks, Gallagher 21 peaks, Katsuura, Lunacek bi-Rastrigin.</p>' },
@@ -2203,13 +2291,14 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         traceSel.value = 0;
         renderVerbosePlot();
       } else {
-        ['plotVerboseAll','plotVerboseIter','plotVerboseTau','plotVerboseSamples'].forEach(function(id) { Plotly.purge(id); });
+        ['plotVerboseAll','plotVerboseIter','plotVerboseTau','plotVerboseSamples','plotVerboseLoss'].forEach(function(id) { Plotly.purge(id); });
+        document.getElementById('verboseLossRow').style.display = 'none';
         document.getElementById('verboseCounter').textContent = '0 / 0';
       }
     }
 
     function _showVerboseLoading(show) {
-      var plots = ['plotVerboseAll','plotVerboseIter','plotVerboseTau','plotVerboseSamples'];
+      var plots = ['plotVerboseAll','plotVerboseIter','plotVerboseTau','plotVerboseSamples','plotVerboseLoss'];
       if (show) {
         plots.forEach(function(id) {
           var el = document.getElementById(id);
@@ -2295,6 +2384,25 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         margin: { t: 40, b: 50, l: 55, r: 55 }, legend: { orientation: 'h', y: 1.12 }, height: 360,
         barmode: 'overlay',
       }, { responsive: true });
+
+      // Row 3: training loss (if available)
+      var lossRow = document.getElementById('verboseLossRow');
+      if (t.loss_tell_counts && t.loss_values && t.loss_values.length) {
+        lossRow.style.display = '';
+        Plotly.react('plotVerboseLoss', [
+          { x: t.loss_tell_counts, y: t.loss_values, mode: 'lines', name: 'diffusion loss',
+            line: { color: c[0], width: 1.5 } },
+        ], {
+          title: 'Training Loss — ' + traceLabel,
+          xaxis: { title: 'tell_count' },
+          yaxis: { title: 'Diffusion Loss', tickformat: '.4g' },
+          margin: { t: 40, b: 50, l: 65, r: 20 },
+          legend: { orientation: 'h', y: 1.12 }, height: 360,
+        }, { responsive: true });
+      } else {
+        lossRow.style.display = 'none';
+        Plotly.purge('plotVerboseLoss');
+      }
     }
 
     function renderVerbosePlot() {
@@ -2332,7 +2440,7 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         .catch(function(err) {
           console.error('Verbose trace fetch error:', err);
           if (_verboseFetchInFlight === fetchId) {
-            ['plotVerboseAll','plotVerboseIter','plotVerboseTau','plotVerboseSamples'].forEach(function(id) {
+            ['plotVerboseAll','plotVerboseIter','plotVerboseTau','plotVerboseSamples','plotVerboseLoss'].forEach(function(id) {
               document.getElementById(id).innerHTML = '<div style="padding:20px;text-align:center;color:#e63946;">Failed to load trace: ' + err.message + '</div>';
             });
           }
@@ -2470,6 +2578,7 @@ def parse_args() -> argparse.Namespace:
 
 
 _EXPERIMENTS_REGISTRY: List[Experiment] = []
+_CACHE_LOCK = threading.Lock()
 _TRACE_CACHE: Dict[str, Optional[dict]] = {}
 _TRACE_CACHE_MAX = 256
 
@@ -2477,8 +2586,9 @@ _TRACE_CACHE_MAX = 256
 def _get_trace_data(exp_id: str, trace_idx: int) -> Optional[dict]:
     """Load and cache verbose trace data for a single (experiment, trace) pair."""
     cache_key = f"{exp_id}|{trace_idx}"
-    if cache_key in _TRACE_CACHE:
-        return _TRACE_CACHE[cache_key]
+    with _CACHE_LOCK:
+        if cache_key in _TRACE_CACHE:
+            return _TRACE_CACHE[cache_key]
 
     exp = next((e for e in _EXPERIMENTS_REGISTRY if e.exp_id == exp_id), None)
     if exp is None or trace_idx < 0 or trace_idx >= len(exp.verbose_traces):
@@ -2491,10 +2601,23 @@ def _get_trace_data(exp_id: str, trace_idx: int) -> Optional[dict]:
 
     result = _process_single_npz(npz_path)
 
-    if len(_TRACE_CACHE) >= _TRACE_CACHE_MAX:
-        oldest_key = next(iter(_TRACE_CACHE))
-        del _TRACE_CACHE[oldest_key]
-    _TRACE_CACHE[cache_key] = result
+    # Attach matching loss data if a *_losses.csv exists for the same (f, d, i)
+    if result is not None and trace_meta.function_id is not None:
+        fid, dim, iid = trace_meta.function_id, trace_meta.dimension, trace_meta.instance_id
+        for lt in exp.loss_traces:
+            if lt.function_id == fid and lt.dimension == dim and lt.instance_id == iid:
+                loss_csv = exp.abs_path / "verbose_logs" / lt.filename
+                loss_data = _process_single_loss_csv(loss_csv)
+                if loss_data:
+                    result["loss_tell_counts"] = loss_data["tell_counts"]
+                    result["loss_values"] = loss_data["losses"]
+                break
+
+    with _CACHE_LOCK:
+        if len(_TRACE_CACHE) >= _TRACE_CACHE_MAX:
+            oldest_key = next(iter(_TRACE_CACHE))
+            del _TRACE_CACHE[oldest_key]
+        _TRACE_CACHE[cache_key] = result
     return result
 
 
@@ -2676,8 +2799,11 @@ def main() -> None:
                 port = _find_free_port(port + 1)
                 print(f"Could not free port {old_port}, using port {port} instead.", flush=True)
 
-        socketserver.TCPServer.allow_reuse_address = True
-        httpd = socketserver.TCPServer(("0.0.0.0", port), Handler)
+        class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+            allow_reuse_address = True
+            daemon_threads = True
+
+        httpd = ThreadedTCPServer(("0.0.0.0", port), Handler)
 
         def _shutdown(signum, frame):
             print("\nShutting down server...", flush=True)
