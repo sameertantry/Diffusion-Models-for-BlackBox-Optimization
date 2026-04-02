@@ -26,7 +26,7 @@
 
         "batch_size": 128,
         "lr_diffusion": 0.0003,
-        "train_steps": 100,
+        "num_epochs": 10,
 
         "elite_min_per_dim": 5,
         "elite_max_per_dim": 100,
@@ -69,7 +69,7 @@
         "ema_decay": 0.995,
 
         "reinit_interval": 0,
-        "reinit_train_steps": 200,
+        "reinit_epochs": 50,
 
         "seed": 42,
         "min_data_per_dim": 10,

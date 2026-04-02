@@ -12,7 +12,7 @@
 
     "_description": "Isolate preconditioning effect: compare none / standardize / whiten_shrink / whiten_ema",
     "_grid": {
-        "optimizer.precondition.type": ["none", "standardize", "whiten_ema"]
+        "optimizer.precondition.type": ["none", "standardize", "whiten_ema", "whiten_shrink"]
     },
     "_grid_notes": "4 runs. Fixed: sobol exploration, quality elite, percentile_annealing conditioning.",
 
@@ -30,7 +30,7 @@
 
         "batch_size": 128,
         "lr_diffusion": 0.001,
-        "train_steps": 200,
+        "num_epochs": 20,
 
         "elite_min_per_dim": 32,
         "elite_max_per_dim": 100,
@@ -67,7 +67,7 @@
         "ema_decay": -1,
 
         "reinit_interval": 0,
-        "reinit_train_steps": 200,
+        "reinit_epochs": 50,
 
         "seed": 42,
         "min_data_per_dim": 256,

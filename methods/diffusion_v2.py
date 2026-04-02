@@ -41,9 +41,9 @@ Changes from :class:`DiffusionOptimizer`
    trained from scratch on the current elite, preventing accumulation of
    stale representations.
 
-9. **Adaptive training steps with early stopping** — the number of
-   gradient steps scales with elite buffer size and stops early when
-   loss plateaus, preventing overfitting on small buffers.
+9. **Epoch-based training with early stopping** — training runs for a
+   configurable number of epochs (full passes over the elite buffer)
+   and stops early when loss plateaus, preventing overfitting.
 
 10. **Min-SNR loss weighting** — per-timestep loss weights based on
     signal-to-noise ratio reduce dominance of easy high-SNR timesteps.
@@ -205,10 +205,10 @@ class DiffusionOptimizerV2(BaseOptimizer):
         Mini-batch size for SGD.
     lr_diffusion, lr_regressor : float
         Learning rates.
-    train_steps : int
-        Upper bound on gradient steps per ``tell()`` call.  Actual
-        steps are scaled by elite buffer size and may terminate early
-        if the loss plateaus.
+    num_epochs : int
+        Number of training epochs per ``tell()`` call.  Each epoch
+        iterates once over the elite buffer.  Training may terminate
+        early if the loss plateaus.
     elite_min_per_dim : int
         Minimum elite buffer size per dimension.  The actual floor is
         ``max(2, elite_min_per_dim × input_dim)``.
@@ -327,11 +327,10 @@ class DiffusionOptimizerV2(BaseOptimizer):
     reinit_interval : int
         If > 0, reinitialise model weights and optimiser state every
         this many ``tell()`` calls, then retrain from scratch on the
-        current elite with ``reinit_train_steps`` gradient steps.
-        0 disables.
-    reinit_train_steps : int
-        Number of gradient steps used after a model reinitialisation.
-        Typically larger than ``train_steps`` to allow convergence.
+        current elite with ``reinit_epochs`` epochs.  0 disables.
+    reinit_epochs : int
+        Number of training epochs after a model reinitialisation.
+        Typically larger than ``num_epochs`` to allow convergence.
     seed : int
         Random seed.
     min_data : float or int
@@ -367,7 +366,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         batch_size: int = 64,
         lr_diffusion: float = 3e-4,
         lr_regressor: float = 1e-3,
-        train_steps: int = 50,
+        num_epochs: int = 10,
         elite_min_per_dim: int = 5,
         elite_max_per_dim: int = 100,
         elite_filter: Optional[Dict[str, Any]] = None,
@@ -385,7 +384,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         x_noise_std: float = 0.01,
         ema_decay: float = 0.995,
         reinit_interval: int = 0,
-        reinit_train_steps: int = 200,
+        reinit_epochs: int = 50,
         y_norm_type: str = "rank",
         explore_anneal: bool = True,
         snr_loss_weighting: bool = True,
@@ -416,7 +415,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
         self.num_timesteps = num_timesteps
         self.batch_size = batch_size
-        self.train_steps = train_steps
+        self.num_epochs = num_epochs
         if elite_min_per_dim > elite_max_per_dim:
             raise ValueError(
                 f"elite_min_per_dim ({elite_min_per_dim}) must be <= "
@@ -501,7 +500,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.x_noise_std = x_noise_std
         self.ema_decay = ema_decay
         self.reinit_interval = reinit_interval
-        self.reinit_train_steps = reinit_train_steps
+        self.reinit_epochs = reinit_epochs
         if y_norm_type not in ("rank", "mean_std"):
             raise ValueError(
                 f"Unknown y_norm_type {y_norm_type!r}. "
@@ -1121,9 +1120,15 @@ class DiffusionOptimizerV2(BaseOptimizer):
         x_train: torch.Tensor,
         y_train: torch.Tensor,
         weights: Optional[torch.Tensor] = None,
-        steps: Optional[int] = None,
+        epochs: Optional[int] = None,
     ) -> Tuple[List[float], List[float]]:
         """Run SGD on the elite buffer with rank weighting.
+
+        Parameters
+        ----------
+        epochs : int or None
+            Override for the number of training epochs.  When ``None``,
+            ``self.num_epochs`` is used.
 
         Returns
         -------
@@ -1140,12 +1145,9 @@ class DiffusionOptimizerV2(BaseOptimizer):
         effective_batch = min(self.batch_size, n_data)
 
         steps_per_epoch = max(1, n_data // effective_batch)
-        if steps is not None:
-            n_steps = steps
-        else:
-            target_epochs = min(self.train_steps // max(steps_per_epoch, 1), 30)
-            target_epochs = max(target_epochs, 3)
-            n_steps = steps_per_epoch * target_epochs
+        n_epochs = epochs if epochs is not None else self.num_epochs
+        n_epochs = max(n_epochs, 1)
+        n_steps = steps_per_epoch * n_epochs
 
         _ES_PATIENCE = 10
         _ES_WINDOW = 10
@@ -1405,8 +1407,8 @@ class DiffusionOptimizerV2(BaseOptimizer):
         y_train = _to_tensor(y_normalized, self.device)
 
         weights = self._compute_rank_weights(y_arr)
-        steps = self.reinit_train_steps if do_reinit else None
-        d_losses, r_losses = self._train_networks(x_train, y_train, weights, steps=steps)
+        reinit_ep = self.reinit_epochs if do_reinit else None
+        d_losses, r_losses = self._train_networks(x_train, y_train, weights, epochs=reinit_ep)
         self._log_training_losses(d_losses, r_losses)
 
         # Report the elite-buffer floor as "tau" for verbose logging
