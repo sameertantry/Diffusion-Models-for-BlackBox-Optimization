@@ -1,0 +1,30 @@
+# Minimal requirements for coco_wrapper + diffusion_v2 optimizer
+# with CMA-ES and TPE baselines for comparison
+
+# Core numerics
+numpy==1.24.4
+
+# PyTorch - main framework for diffusion_v2
+torch==2.10.0
+
+# Diffusion models
+diffusers==0.36.0
+
+# COCO/BBOB benchmark suite
+coco-experiment==2.8.2
+cocopp==2.8.1
+
+# Supporting packages for torch and diffusers
+filelock==3.20.3
+safetensors==0.7.0
+huggingface_hub==0.36.2
+packaging==26.0
+requests==2.32.5
+tqdm==4.67.1
+
+# Baseline optimizers for comparison
+cma==4.4.2
+optuna==4.7.0
+
+# Utilities
+PyYAML==6.0.3

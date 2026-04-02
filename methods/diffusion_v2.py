@@ -142,6 +142,21 @@ _EXPLORATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "lhs": {},
 }
 
+# ------------------------------------------------------------------ #
+# Local search defaults                                                #
+# ------------------------------------------------------------------ #
+_LOCAL_SEARCH_DEFAULTS: Dict[str, Any] = {
+    "enabled": False,
+    "frac": 0.15,
+    "frac_max": 0.30,
+    "anneal": True,
+    "n_anchors": 5,
+    "sigma_init": 0.2,
+    "sigma_decay": "quadratic",
+    "use_covariance": True,
+    "anchor_selection": "elite_score",
+}
+
 
 # ------------------------------------------------------------------ #
 # Ledoit-Wolf analytical shrinkage                                     #
@@ -301,6 +316,28 @@ class DiffusionOptimizerV2(BaseOptimizer):
           gates make the network start as an identity (predict zero
           noise), which is the correct inductive bias for epsilon
           prediction.  Slightly more parameters per block than FiLM.
+    local_search : dict or None
+        Configuration for the local search component.  ``None`` uses
+        defaults (disabled).  A dict with any of these keys:
+
+        * ``"enabled"`` (bool, default False) — master switch.
+        * ``"frac"`` (float, default 0.15) — initial fraction of
+          ``ask()`` candidates generated via local mutations.
+        * ``"frac_max"`` (float, default 0.30) — ceiling when annealing.
+        * ``"anneal"`` (bool, default True) — cosine-grow ``frac``
+          toward ``frac_max`` as optimisation progresses.
+        * ``"n_anchors"`` (int, default 5) — number of anchor points
+          selected from the elite buffer by ``elite_filter`` score.
+        * ``"sigma_init"`` (float, default 0.2) — initial mutation
+          scale in normalised ``[-1, 1]`` space.
+        * ``"sigma_decay"`` (str, default ``"quadratic"``) — sigma
+          adaptation method: ``"quadratic"`` / ``"linear"`` (progress-
+          based) or ``"one_fifth"`` (adaptive 1/5 success rule).
+        * ``"use_covariance"`` (bool, default True) — if True and
+          preconditioning is active, use the inverse transform to
+          produce covariant mutations along learned correlation axes.
+        * ``"anchor_selection"`` (str, default ``"elite_score"``) —
+          reserved for future anchor selection strategies.
     rank_temperature : float
         Controls the sharpness of rank-weighted sampling (lower → more
         uniform, higher → more concentrated on the best points).
@@ -379,6 +416,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         conditioning: Optional[Dict[str, Any]] = None,
         precondition: Optional[Dict[str, Any]] = None,
         exploration: Optional[Dict[str, Any]] = None,
+        local_search: Optional[Dict[str, Any]] = None,
         rank_temperature: float = 0.5,
         weight_decay: float = 1e-4,
         x_noise_std: float = 0.01,
@@ -472,6 +510,13 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.exploration: Dict[str, Any] = {
             **_EXPLORATION_DEFAULTS[etype], **exploration,
         }
+
+        # Resolve local search config
+        if local_search is None:
+            local_search = {}
+        self.local_search: Dict[str, Any] = {**_LOCAL_SEARCH_DEFAULTS, **local_search}
+        self._ls_sigma: float = float(self.local_search["sigma_init"])
+        self._last_n_local: int = 0
 
         # Resolve conditioning strategy config
         if conditioning is None:
@@ -727,6 +772,118 @@ class DiffusionOptimizerV2(BaseOptimizer):
             )
 
         return self._sample_uniform(n)
+
+    # -- local search -------------------------------------------------- #
+
+    def _generate_local_samples(self, n: int) -> np.ndarray:
+        """Generate *n* candidates via mutation of anchor points.
+
+        Anchors are selected from the elite buffer using the same scoring
+        function as ``elite_filter``.  Mutations are optionally covariant
+        (using the preconditioning inverse matrix) so the perturbation
+        follows the learned correlation structure.
+
+        Parameters
+        ----------
+        n : int
+            Number of local search samples to generate.
+
+        Returns
+        -------
+        np.ndarray, shape ``(n, input_dim)``
+            Candidates clipped to ``[lower, upper]``.
+        """
+        if len(self.y_data) == 0:
+            return self._sample_uniform(n)
+
+        ls = self.local_search
+        n_anchors = min(max(int(ls["n_anchors"]), 1), len(self.y_data))
+
+        # Compute scores once and reuse for both anchor selection and weighting
+        scores = self._compute_elite_scores()
+        top_idx = np.argpartition(scores, -n_anchors)[-n_anchors:]
+        top_idx = top_idx[np.argsort(-scores[top_idx])]
+        anchor_idx = top_idx.tolist()
+
+        anchor_scores = np.array([scores[i] for i in anchor_idx], dtype=np.float64)
+        # Shift to positive for softmax-like weighting
+        anchor_scores -= anchor_scores.min()
+        total = anchor_scores.sum()
+        if total < 1e-12:
+            # Uniform distribution across anchors
+            counts = np.full(len(anchor_idx), n // len(anchor_idx), dtype=int)
+            counts[0] += n - counts.sum()
+        else:
+            fracs = anchor_scores / total
+            counts = np.round(fracs * n).astype(int)
+            # Fix rounding: adjust the best anchor
+            counts[0] += n - counts.sum()
+
+        sigma = self._ls_sigma
+        use_cov = bool(ls["use_covariance"]) and self._pc_inverse is not None
+
+        candidates = []
+        for idx, count in zip(anchor_idx, counts):
+            if count <= 0:
+                continue
+            x_anchor = self.x_data[idx]  # original space
+            x_norm = self._normalize_x(x_anchor)  # [-1, 1]
+
+            noise = self.rng.standard_normal((count, self.input_dim)).astype(np.float64)
+            if use_cov:
+                # Covariant mutations along learned correlation axes
+                noise = noise @ self._pc_inverse.T
+            noise *= sigma
+
+            x_new_norm = x_norm + noise
+            x_new = self._denormalize_x(x_new_norm.astype(np.float32))
+            x_new = np.clip(x_new, self.lower, self.upper)
+            candidates.append(x_new)
+
+        return np.concatenate(candidates, axis=0) if candidates else self._sample_uniform(n)
+
+    def _update_ls_sigma(self, y_batch: np.ndarray, prev_best_y: float) -> None:
+        """Adapt local search sigma.
+
+        For ``"one_fifth"`` mode: if more than 20% of the batch
+        evaluations improved upon ``prev_best_y`` (the elite best
+        *before* ingestion), increase sigma; otherwise shrink it.
+
+        For ``"quadratic"`` / ``"linear"`` modes the sigma is a
+        deterministic function of optimisation progress.
+
+        Parameters
+        ----------
+        y_batch : np.ndarray
+            Negated objective values of the batch (maximisation convention).
+        prev_best_y : float
+            Best elite y *before* this batch was ingested.
+        """
+        if len(y_batch) == 0:
+            return
+
+        ls = self.local_search
+        decay_type = str(ls["sigma_decay"])
+
+        if decay_type == "one_fifth":
+            n_success = int(np.sum(y_batch > prev_best_y))
+            ratio = n_success / len(y_batch)
+            if ratio > 0.2:
+                self._ls_sigma *= 1.2
+            else:
+                self._ls_sigma *= 0.82  # ≈ (1/1.2)
+        elif decay_type == "quadratic":
+            progress = self._optimization_progress
+            sigma_init = float(ls["sigma_init"])
+            self._ls_sigma = sigma_init * (1.0 - progress) ** 2
+        else:  # "linear"
+            progress = self._optimization_progress
+            sigma_init = float(ls["sigma_init"])
+            self._ls_sigma = sigma_init * max(1.0 - progress, 0.01)
+
+        # Clamp sigma to reasonable bounds
+        self._ls_sigma = max(self._ls_sigma, 1e-6)
+        self._ls_sigma = min(self._ls_sigma, 2.0)
 
     # -- elite buffer management --------------------------------------- #
 
@@ -1238,23 +1395,50 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
     def ask(self, n: int = 1) -> np.ndarray:
         if self.exploration_stage:
-            #print("Exploration stage")
             x_init = self._sample_initial(n)
             self._register_asked(x_init)
             return x_init
 
-        #print("Exploitation stage")
+        progress = self._optimization_progress
+
+        # -- compute fractions for the 3-component pipeline ---------------
+        #   explore: cosine decay from explore_frac → 0.01
+        #   local:   cosine growth from local_frac → local_frac_max
+        #   exploit: remainder
 
         if self.explore_anneal:
-            progress = self._optimization_progress
-            current_frac = self.explore_frac * 0.5 * (
-                1.0 + math.cos(math.pi * progress)
-            )
-            current_frac = max(current_frac, 0.01)
+            explore_f = self.explore_frac * 0.5 * (1.0 + math.cos(math.pi * progress))
+            explore_f = max(explore_f, 0.01)
         else:
-            current_frac = self.explore_frac
-        n_explore = int(n * current_frac)
-        n_exploit = n - n_explore
+            explore_f = self.explore_frac
+
+        ls_enabled = bool(self.local_search["enabled"])
+        if ls_enabled:
+            ls_frac_init = float(self.local_search["frac"])
+            ls_frac_max = float(self.local_search["frac_max"])
+            if self.local_search["anneal"]:
+                # Cosine growth from frac → frac_max
+                local_f = ls_frac_init + (ls_frac_max - ls_frac_init) * 0.5 * (
+                    1.0 - math.cos(math.pi * progress)
+                )
+            else:
+                local_f = ls_frac_init
+        else:
+            local_f = 0.0
+
+        # Ensure fractions don't exceed 1.0; clip explore first, then local
+        if explore_f + local_f > 0.95:
+            scale = 0.95 / (explore_f + local_f)
+            explore_f *= scale
+            local_f *= scale
+
+        n_explore = int(n * explore_f)
+        n_local = int(n * local_f)
+        n_exploit = n - n_explore - n_local
+        # Safety: n_exploit must be non-negative
+        if n_exploit < 0:
+            n_local += n_exploit  # reduce local
+            n_exploit = 0
 
         candidates: List[np.ndarray] = []
 
@@ -1301,9 +1485,17 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
             candidates.append(x_np)
 
-        # -- exploration: uniform random ---------------------------------
+        # -- local search: mutations of anchor points --------------------
+        if n_local > 0:
+            x_local = self._generate_local_samples(n_local)
+            self._last_n_local = n_local  # track for sigma update in tell()
+            candidates.append(x_local)
+        else:
+            self._last_n_local = 0
+
+        # -- exploration: strategy-aware sampling ------------------------
         if n_explore > 0:
-            candidates.append(self._sample_uniform(n_explore))
+            candidates.append(self._sample_initial(n_explore))
 
         x_out = np.concatenate(candidates, axis=0) if len(candidates) > 1 else candidates[0]
 
@@ -1316,6 +1508,8 @@ class DiffusionOptimizerV2(BaseOptimizer):
         x = np.asarray(x, dtype=np.float32)
         y_obj = np.asarray(y, dtype=np.float32).reshape(-1)
         y = -y_obj  # minimisation → maximisation
+
+        prev_best_y = self.best_y  # snapshot for 1/5 rule
 
         for xi, yi in zip(x, y):
             self.num_evals += 1
@@ -1340,6 +1534,10 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self._update_elite()
         self._update_normalization()
         self._update_precondition()
+
+        # Update local search sigma
+        if self.local_search["enabled"]:
+            self._update_ls_sigma(y, prev_best_y)
 
         # Periodic reinitialisation
         do_reinit = (
@@ -1500,6 +1698,8 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.best_y = -np.inf
         self.best_x = None
 
+        self.exploration_stage = True
+
         self._pc_mean = None
         self._pc_transform = None
         self._pc_inverse = None
@@ -1507,6 +1707,10 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self._pc_clip_range = float(self._scheduler_config["clip_sample_range"])
 
         self._elite_floor = -np.inf
+
+        # Reset local search sigma
+        self._ls_sigma = float(self.local_search["sigma_init"])
+        self._last_n_local = 0
 
         if self.exploration["type"] == "sobol":
             from scipy.stats.qmc import Sobol

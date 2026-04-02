@@ -38,6 +38,17 @@
         "exploration": {
             "type": "uniform"
         },
+        "local_search": {
+            "enabled": false,
+            "frac": 0.15,
+            "frac_max": 0.30,
+            "anneal": true,
+            "n_anchors": 5,
+            "sigma_init": 0.2,
+            "sigma_decay": "quadratic",
+            "use_covariance": true,
+            "anchor_selection": "elite_score"
+        },
 
         "explore_frac": 0.05,
         "explore_anneal": true,
