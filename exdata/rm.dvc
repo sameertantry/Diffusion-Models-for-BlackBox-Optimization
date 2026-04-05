@@ -1,0 +1,6 @@
+outs:
+- md5: d33a1ea111e7a1cac87d6c50c0461478.dir
+  size: 838517129
+  nfiles: 5896
+  hash: md5
+  path: rm

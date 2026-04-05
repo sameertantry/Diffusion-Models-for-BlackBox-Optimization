@@ -1,5 +1,7 @@
 __pycache__
-/exdata
+/exdata/**
+!/exdata/**/*.dvc
+!/exdata/**/.gitignore
 /plots
 /outputs
 /ppdata
