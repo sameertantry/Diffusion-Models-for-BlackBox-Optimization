@@ -1,0 +1,18 @@
+{
+    "_description": "CMA-ES baseline with budget 2048*d for scaling comparison C2.",
+    "method": "cma_es",
+    "algorithm_name": "CMA-ES",
+    "suite_name": "bbob",
+    "suite_instance": "",
+    "suite_options": "dimensions: 2,5,10 instance_indices: 1-2",
+    "budget_multiplier": 10000,
+    "eval_batch_size": 64,
+    "precision": 0.1,
+    "output_folder": "rm/ablation/budget/cmaes_10000",
+    "post_process": false,
+    "optimizer": {
+        "seed": 42,
+        "sigma0": 0.5,
+        "verbose": false
+    }
+}

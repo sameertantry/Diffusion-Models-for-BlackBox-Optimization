@@ -1,0 +1,14 @@
+# Ignore all image files (generated during script execution)
+*.png
+*.jpeg
+*.jpg
+
+# Ignore extra BBOB data file variants not used by build_coco_dashboard.py
+*.tdat
+*.rdat
+*.mdat
+
+# Keep: bbobexp_f*.info files (metadata)
+# Keep: *.dat files (actual benchmark data)
+# Keep: verbose_logs/*.npz files (verbose traces)
+# Keep: verbose_logs/*_losses.csv files (loss data)
