@@ -1,4 +1,9 @@
 {
+    "_description": "Stage-3b: local search frac grid (including higher frac=0.45) × rank_temperature. All quadratic decay. Extends stage-3 with larger frac and rank_temp=0.3.",
+    "_grid": {
+        "optimizer.local_search.frac": [0.15, 0.30, 0.45]
+    },
+    "_grid_notes": "6 runs. frac=0.15/0.30 with rt=0.5 already ran in stage-3 — those 2 are duplicates for comparison but re-run with identical config is fine. New runs: frac=0.45 (×2) and rt=0.3 (×3). frac=0.45 allocates 29 of 64 to local mutations, leaving only 32 for diffusion exploitation.",
     "method": "diffusion_v2",
     "algorithm_name": "DiffusionV2",
     "suite_name": "bbob",
@@ -7,7 +12,7 @@
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "rm/optimal/stage-2/diverse_batch/sobol/low_percentile0.7_high_offset0.2",
+    "output_folder": "rm/optimal/stage-3b/ls_rank",
     "post_process": false,
     "optimizer": {
         "num_timesteps": 100,
@@ -35,7 +40,15 @@
             "type": "sobol"
         },
         "local_search": {
-            "enabled": false
+            "enabled": true,
+            "frac": 0.15,
+            "frac_max": 0.55,
+            "anneal": true,
+            "n_anchors": 5,
+            "sigma_init": 0.2,
+            "sigma_decay": "quadratic",
+            "use_covariance": true,
+            "anchor_selection": "elite_score"
         },
         "inference": {
             "type": "ddim",

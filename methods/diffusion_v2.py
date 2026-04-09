@@ -84,7 +84,7 @@ from methods.diffusion import (
     create_noise_predictor,
 )
 
-from diffusers import DDPMScheduler
+from diffusers import DDIMScheduler, DDPMScheduler
 
 
 # ------------------------------------------------------------------ #
@@ -140,6 +140,14 @@ _EXPLORATION_DEFAULTS: Dict[str, Dict[str, Any]] = {
     "uniform": {},
     "sobol": {},
     "lhs": {},
+}
+
+# ------------------------------------------------------------------ #
+# Inference scheduler defaults                                         #
+# ------------------------------------------------------------------ #
+_INFERENCE_DEFAULTS: Dict[str, Dict[str, Any]] = {
+    "ddpm": {},
+    "ddim": {"eta": 0.0},
 }
 
 # ------------------------------------------------------------------ #
@@ -417,6 +425,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         precondition: Optional[Dict[str, Any]] = None,
         exploration: Optional[Dict[str, Any]] = None,
         local_search: Optional[Dict[str, Any]] = None,
+        inference: Optional[Dict[str, Any]] = None,
         rank_temperature: float = 0.5,
         weight_decay: float = 1e-4,
         x_noise_std: float = 0.01,
@@ -440,6 +449,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
             bounds=bounds,
             verbose=verbose,
         )
+        self._seed = int(seed)
         self.rng = np.random.default_rng(seed)
         self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
         torch.manual_seed(seed)
@@ -517,6 +527,19 @@ class DiffusionOptimizerV2(BaseOptimizer):
         self.local_search: Dict[str, Any] = {**_LOCAL_SEARCH_DEFAULTS, **local_search}
         self._ls_sigma: float = float(self.local_search["sigma_init"])
         self._last_n_local: int = 0
+
+        # Resolve inference scheduler config
+        if inference is None:
+            inference = {"type": "ddpm"}
+        itype = inference.get("type", "ddpm")
+        if itype not in _INFERENCE_DEFAULTS:
+            raise ValueError(
+                f"Unknown inference type {itype!r}. "
+                f"Supported: {list(_INFERENCE_DEFAULTS)}"
+            )
+        self.inference: Dict[str, Any] = {
+            **_INFERENCE_DEFAULTS[itype], **inference,
+        }
 
         # Resolve conditioning strategy config
         if conditioning is None:
@@ -651,7 +674,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
             base = max(1, int(self.min_data_frac * self.budget))
         else:
             raise ValueError("min_data_frac must be <= 1.0 or budget must be set")
-        return base
+        return min(base, self.elite_size)
 
     # -- normalisation ------------------------------------------------- #
 
@@ -1028,6 +1051,9 @@ class DiffusionOptimizerV2(BaseOptimizer):
         linearly from ``_elite_max_init`` to ``elite_min`` over the
         optimisation budget (LSHADE-style), and a soft quality floor
         prevents the buffer from retaining very poor points.
+
+        After eviction, the global best point is guaranteed to be
+        present in the buffer (pinned).
         """
         n = len(self.y_data)
 
@@ -1065,14 +1091,33 @@ class DiffusionOptimizerV2(BaseOptimizer):
             if len(keep_idx) < n:
                 self.x_data = [self.x_data[i] for i in keep_idx]
                 self.y_data = [self.y_data[i] for i in keep_idx]
-            return
 
-        if n <= self.elite_size:
+        elif n > self.elite_size:
+            scores = self._compute_elite_scores()
+            keep_idx = np.argpartition(scores, -self.elite_size)[-self.elite_size:]
+            self.x_data = [self.x_data[i] for i in keep_idx]
+            self.y_data = [self.y_data[i] for i in keep_idx]
+
+        # Pin the global best: ensure it is always in the elite buffer
+        self._pin_global_best()
+
+    def _pin_global_best(self) -> None:
+        """Ensure the global best point is present in the elite buffer.
+
+        Called as the final step of ``_update_elite``.  If the best
+        point was evicted (e.g. by a diversity-based filter), it is
+        appended back to the buffer so the model always trains on it.
+        """
+        if self.best_x is None or not np.isfinite(self.best_y):
             return
-        scores = self._compute_elite_scores()
-        keep_idx = np.argpartition(scores, -self.elite_size)[-self.elite_size:]
-        self.x_data = [self.x_data[i] for i in keep_idx]
-        self.y_data = [self.y_data[i] for i in keep_idx]
+        if len(self.y_data) == 0:
+            self.x_data.append(self.best_x.copy())
+            self.y_data.append(float(self.best_y))
+            return
+        buffer_best = max(self.y_data)
+        if buffer_best < self.best_y:
+            self.x_data.append(self.best_x.copy())
+            self.y_data.append(float(self.best_y))
 
     # -- rank-weighted sampling ---------------------------------------- #
 
@@ -1086,7 +1131,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         if n <= 1:
             return torch.ones(max(n, 1), dtype=torch.float32, device=self.device)
         ranks = np.argsort(np.argsort(-y_values)).astype(np.float64)
-        temp = max(self.rank_temperature * self.elite_min, 1.0)
+        temp = max(self.rank_temperature * n, 1.0)
         weights = np.exp(-ranks / temp)
         weights /= weights.sum()
         return torch.tensor(weights, dtype=torch.float32, device=self.device)
@@ -1306,13 +1351,15 @@ class DiffusionOptimizerV2(BaseOptimizer):
         n_epochs = max(n_epochs, 1)
         n_steps = steps_per_epoch * n_epochs
 
-        _ES_PATIENCE = 10
         _ES_WINDOW = 10
-        _ES_REL_DELTA = 0.01
+        progress = self._optimization_progress
+        # Early: aggressive ES (data is volatile); Late: patient ES (fine-tuning)
+        _ES_PATIENCE = int(5 + 15 * progress)       # 5 → 20
+        _ES_REL_DELTA = 0.02 - 0.015 * progress     # 0.02 → 0.005
         best_avg_loss = float('inf')
         no_improve = 0
         es_losses: List[float] = []
-        min_steps_for_es = max(steps_per_epoch, _ES_WINDOW)
+        min_steps_for_es = max(2 * steps_per_epoch, _ES_WINDOW)
 
         snr_weights_all: Optional[torch.Tensor] = None
         if self.snr_loss_weighting:
@@ -1451,7 +1498,12 @@ class DiffusionOptimizerV2(BaseOptimizer):
 
             inf_cfg = {**self._scheduler_config,
                        "clip_sample_range": self._pc_clip_range}
-            scheduler = DDPMScheduler(**inf_cfg)
+            use_ddim = self.inference["type"] == "ddim"
+            if use_ddim:
+                scheduler = DDIMScheduler(**inf_cfg)
+                ddim_eta = float(self.inference.get("eta", 0.0))
+            else:
+                scheduler = DDPMScheduler(**inf_cfg)
             scheduler.set_timesteps(self.num_timesteps, device=self.device)
 
             x_t = torch.randn(n_exploit, self.input_dim, device=self.device)
@@ -1471,7 +1523,14 @@ class DiffusionOptimizerV2(BaseOptimizer):
                     eps_guided = eps_theta - self.guidance_strength * grad
 
                 with torch.no_grad():
-                    scheduler_output = scheduler.step(eps_guided, int(t), x_t)
+                    if use_ddim:
+                        scheduler_output = scheduler.step(
+                            eps_guided, int(t), x_t, eta=ddim_eta,
+                        )
+                    else:
+                        scheduler_output = scheduler.step(
+                            eps_guided, int(t), x_t,
+                        )
                     x_t = scheduler_output.prev_sample
 
             x_np_pc = x_t.detach().cpu().numpy().astype(np.float64)
@@ -1715,7 +1774,7 @@ class DiffusionOptimizerV2(BaseOptimizer):
         if self.exploration["type"] == "sobol":
             from scipy.stats.qmc import Sobol
             self._sobol_engine = Sobol(
-                d=self.input_dim, scramble=True, seed=42,
+                d=self.input_dim, scramble=True, seed=self._seed,
             )
 
         self._reinit_model()

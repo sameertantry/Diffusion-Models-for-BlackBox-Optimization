@@ -1,346 +1,289 @@
 # Diffusion Models for BlackBox Optimization
 
-## DiffusionOptimizerV2 (step-by-step algorithm)
+## DiffusionOptimizerV2 — Algorithm Description
 
 ### Overview
 
-`DiffusionOptimizerV2` is an iterative black-box optimizer that maintains an **elite buffer** of the best-evaluated points and trains a **conditional denoising diffusion model** (DDPM) to generate new candidate solutions conditioned on high quality. The ask-tell loop alternates between generating candidates (`ask`) and incorporating their evaluations (`tell`).
+`DiffusionOptimizerV2` is an iterative black-box optimizer that maintains an **elite buffer** of the best-evaluated points and trains a **conditional denoising diffusion model** to generate new candidate solutions conditioned on high quality. The ask/tell loop alternates between generating candidates (`ask`) and incorporating their evaluations (`tell`).
+
+The optimizer supports three sample-generation components per batch: **exploitation** (reverse diffusion), **local search** (mutation-based), and **exploration** (random/structured). Their fractions are controlled by cosine annealing schedules.
 
 ---
 
 ### Step 0: Initialization
 
-When the optimizer is created for a problem with dimension \( d \) and bounds \([\text{lower}, \text{upper}]\):
+When the optimizer is created for a problem with dimension *d* and bounds [lower, upper]:
 
-1. **Elite buffer sizing**:
+1. **[Elite buffer](#elite-buffer-management) sizing**:
    - `elite_min = max(2, elite_min_per_dim × d)`
    - `elite_size = max(elite_min, elite_max_per_dim × d)`
-   - Example: defaults `elite_min_per_dim=5`, `elite_max_per_dim=100`, \(d=5\) → `elite_min=25`, `elite_size=500`.
 
-2. **Noise predictor network** is created based on `noise_pred_arch`:
-   - **`concat_mlp`**: Plain MLP that concatenates \([x_t, \text{time\_emb}, y_\text{cond}]\) at the input. Conditioning only enters at the first layer and can be diluted through depth. Good baseline and can be OK in very low dimension; usually weaker for complex conditioning.
-   - **`film_resnet`**: MLP with residual blocks + FiLM conditioning. Time+y conditioning is injected at *every* layer via learned scale+shift; LayerNorm stabilizes online training. This prevents conditioning dilution and is the recommended default.
-   - **`adaln_resnet`**: DiT-style Adaptive LayerNorm residual blocks. Conditioning controls normalization parameters and a learned gate. Gates are zero-initialized so the network starts near identity (predicts ~0 noise), which matches the epsilon-prediction inductive bias.
+2. **[Noise predictor network](#noise-predictor-architectures)** is created based on `noise_pred_arch` (`concat_mlp`, `film_resnet`, or `adaln_resnet`).
 
-3. **EMA copy** of the noise predictor is created if `ema_decay > 0`. This EMA network is used for inference in `ask()` because it is typically more stable than the raw online-updated network.
+3. **[EMA copy](#ema-model)** of the noise predictor is created if `ema_decay > 0`. Used for inference in `ask()`.
 
-4. **DDPM scheduler** (`DDPMScheduler`) is configured with:
-   - number of diffusion timesteps (`num_train_timesteps = num_timesteps`)
-   - beta schedule (`beta_schedule`, `beta_start`, `beta_end`)
-   - prediction type (`prediction_type`)
-   - optional internal clipping (`clip_sample`, `clip_sample_range`)
+4. **[DDPM scheduler](#diffusion-scheduler)** is configured for training (noise schedule, timesteps, prediction type, clipping).
 
-5. **Exploration engine**:
-   - If `exploration.type == "sobol"`, initialize a scrambled Sobol sequence generator so that initial sampling is low-discrepancy (space-filling across repeated calls).
+5. **[Inference scheduler](#inference-scheduler-ddpm--ddim)** type is resolved from `inference.type` (`"ddpm"` or `"ddim"`).
 
-6. Start state:
-   - `exploration_stage = True` (pure initial exploration before the model is used)
-   - empty elite buffers `x_data`, `y_data`
-   - global best `best_x`, `best_y`
+6. **[Exploration engine](#exploration-strategies)**: if `exploration.type == "sobol"`, a scrambled Sobol sequence generator is initialized.
+
+7. **Start state**: `exploration_stage = True`, empty elite buffers, `best_y = -∞`.
 
 ---
 
 ### Step 1: `ask(n)` — Generate candidate solutions
 
-There are two regimes.
-
 #### Regime A: Exploration stage (`exploration_stage == True`)
 
-Active until enough data has been collected (`len(x_data) >= _min_data_count`). In this stage `ask(n)` returns `n` samples from `_sample_initial(n)` and **does not use the diffusion model**.
+Active until `len(x_data) >= _min_data_count` (clamped to `elite_size`). Returns `n` samples from the configured [exploration strategy](#exploration-strategies) without using the diffusion model.
 
-The exploration strategy is controlled by `exploration.type`:
+#### Regime B: Exploitation stage
 
-- **`uniform`**:
-  - i.i.d. uniform samples in \([\text{lower}, \text{upper}]\).
-  - Pros: simplest and cheap.
-  - Cons: in higher \(d\), coverage is noisy and can leave large holes.
+Once exploration ends, `ask(n)` produces a **three-component mixture**:
 
-- **`sobol`**:
-  - scrambled Sobol low-discrepancy sequence.
-  - Pros: much more uniform coverage than pure random for the same number of points; sequential calls continue the same global sequence.
-  - Good when you want deterministic space-filling structure in early data.
+1. **Compute fractions** for the three components:
+   - **Exploration** (`explore_frac`): [cosine-annealed](#exploration-annealing) from configured value down to 0.01.
+   - **[Local search](#local-search)** (`local_search.frac`): if enabled, [cosine-grows](#local-search) from `frac` toward `frac_max`.
+   - **Exploitation**: the remainder of the batch.
 
-- **`lhs`**:
-  - Latin Hypercube Sampling (LHS) per call.
-  - Pros: stratified marginal coverage in each dimension for each batch.
-  - Cons: successive calls are independent (no global low-discrepancy “continuation” like Sobol).
+2. **[Exploitation samples](#reverse-diffusion-inference)** (`n_exploit`):
+   - Create an [inference scheduler](#inference-scheduler-ddpm--ddim) (DDPM or DDIM).
+   - Sample initial noise x_T ~ N(0, I) in [preconditioned space](#preconditioning).
+   - Compute [conditioning target](#conditioning-strategies) y_cond.
+   - Run reverse diffusion for `num_timesteps` steps.
+   - [Unprecondition](#preconditioning), denormalize, clip to bounds.
 
-**Motivation for initial exploration**: before training, the diffusion model has no data. The initial data must cover the space well enough that the elite buffer is not biased to a random local region.
+3. **[Local search samples](#local-search)** (`n_local`): mutation-based candidates around anchor points from the elite buffer.
 
-#### Regime B: Exploitation stage (`exploration_stage == False`)
+4. **Exploration samples** (`n_explore`): samples from the configured [exploration strategy](#exploration-strategies).
 
-Once exploration ends, `ask(n)` produces a **mixture** of exploitation (model-guided) and exploration (random) samples.
-
-1. **Choose exploration fraction**:
-   - If `explore_anneal=True`, compute `current_frac` via cosine annealing from the configured `explore_frac` down to 0.01 over the budget (using `num_evals / budget`).
-   - Otherwise `current_frac = explore_frac`.
-   - Split: `n_explore = int(n * current_frac)`, `n_exploit = n - n_explore`.
-
-2. **Exploitation samples** (`n_exploit`):
-   - Create an inference `DDPMScheduler` using the same scheduler config but with `clip_sample_range` replaced by `_pc_clip_range` (dynamic, tracked from training data in preconditioned space).
-   - Sample initial noise: \( x_T \sim \mathcal{N}(0, I) \) in **preconditioned space**.
-   - Compute conditioning target tensor \(y_\text{cond}\) using the selected conditioning strategy (see Step 3).
-   - Run the reverse diffusion loop for `num_timesteps` steps:
-     - Predict noise: \( \epsilon_\theta(x_t, t, y_\text{cond}) \)
-     - Optionally apply regressor guidance (if enabled)
-     - Scheduler step: produce \(x_{t-1}\)
-   - After reverse diffusion ends:
-     - Convert output to numpy: `x_np_pc` (still in preconditioned space)
-     - Inverse preconditioning: `x_np_norm = _unprecondition_x(x_np_pc)` (back to \([-1,1]\) box-normalized)
-     - Denormalize: `_denormalize_x(x_np_norm)` back to original bounds
-     - Clip to `[lower, upper]`
-     - Replace any NaN/Inf rows with uniform random samples
-
-3. **Exploration samples** (`n_explore`):
-   - Uniform random samples in the original bounded domain.
-
-4. Concatenate exploitation + exploration candidates, shuffle them, register the ask, return.
+5. Concatenate, shuffle, return.
 
 ---
 
 ### Step 2: `tell(x, y)` — Incorporate evaluations and train
 
-This step appends new evaluated points, maintains the elite buffer, updates transforms/statistics, and trains the model online.
+#### 2a. Data ingestion
 
-#### 2a. Data ingestion and objective direction
+- Objective values are **negated** internally (minimization → maximization).
+- Each valid point is appended to the elite buffer.
+- Global best (`best_x`, `best_y`) is updated.
 
-- Inputs `x` are cast to float32.
-- Objective values `y_obj` are treated as **minimization** externally; internally the optimizer stores:
-  - `y = -y_obj` so it becomes a maximization signal.
-- For each valid `(x_i, y_i)`:
-  - increment `num_evals`
-  - append to `x_data`, `y_data`
-  - update global best `best_x`, `best_y` if this point is best so far
+#### 2b. Exploration → exploitation transition
 
-#### 2b. Exploration → exploitation transition (data threshold)
+If `exploration_stage` is still True and `len(x_data) < _min_data_count`: return without training. Otherwise, set `exploration_stage = False` permanently.
 
-If `exploration_stage` is still `True`:
-- If `len(x_data) < _min_data_count`: just register `tell()` for verbose logs and return (no training).
-- If `len(x_data) >= _min_data_count`: set `exploration_stage = False` and proceed with training.
+`_min_data_count` is clamped to `elite_size` so the optimizer cannot get stuck in exploration.
 
-`_min_data_count` is derived primarily from `min_data_per_dim × d` (if provided) and is clamped so it does not exceed `elite_size`. This guarantees that once the elite buffer is filled to capacity, the optimizer can exit exploration stage and remain in exploitation stage.
+#### 2c. [Elite buffer management](#elite-buffer-management) (`_update_elite`)
 
-#### 2c. Elite buffer management (`_update_elite`)
+Score and evict lowest-scoring points if buffer exceeds capacity. Supports fixed-size and [adaptive shrinking](#adaptive-elite). After eviction, the [global best is pinned](#global-best-pinning) — guaranteed to remain in the buffer.
 
-The optimizer keeps only a fixed-size set of “elite” points (or an adaptively-sized set if enabled).
+#### 2d. Update y-normalization
 
-- **Fixed-size mode** (default):
-  - If buffer size `n` exceeds `elite_size`, compute a score for each point using `elite_filter` and keep the top `elite_size`.
+Recompute `y_mean` and `y_std` from the elite buffer only.
 
-- **Adaptive elite mode** (`elite_adaptive.enabled = true`):
-  - Compute progress \(p = \min(\text{num\_evals}/\text{budget}, 1)\)
-  - Shrink the elite cap linearly from `_elite_max_init` down to `elite_min` (LSHADE-style).
-  - Maintain a **soft floor** on y-values:
-    \[
-      \text{floor}_t = \max\bigl(\text{floor}_{t-1} (1-\delta),\ \text{percentile}_p(y)\bigr)
-    \]
-  - Prefer keeping points above the floor; if too few, fall back to keeping more broadly.
-  - If too many points are above the floor, select the best `elite_cap` among them using the elite scoring rule.
+#### 2e. Update [preconditioning](#preconditioning) transform
 
-**Elite selection / scoring strategies** (`elite_filter.type`):
+Recompute the whitening/standardization transform from the current elite buffer.
 
-- **`quality`**:
-  - Score = y-value (keep best y).
-  - Very exploitative; can lose diversity.
+#### 2f. Optional periodic reinitialization
 
-- **`quality_knn`**:
-  - Score = normalized y + `diversity_weight` × normalized kNN distance.
-  - Diversity is computed in **preconditioned normalized space** (apply `_precondition_x` to `_normalize_x(x)`), so distance reflects the geometry the model sees.
-  - Good for multimodal problems: keeps several separated basins.
-
-- **`crowding`**:
-  - Sort points by y into `n_tiers` tiers (quality bins).
-  - Within each tier compute NSGA-II style crowding distance (per-dimension neighbor spans).
-  - Final score makes tier dominate, crowding breaks ties.
-  - Good when you want strict quality dominance but still want spread.
-
-- **`grid`**:
-  - Grid archive over normalized \([-1,1]^d\):
-    - Compute grid cell index per point via discretization.
-    - Keep the best point per cell (cell-winners get a big score bonus).
-    - Fill remaining capacity by global quality.
-  - For \(d>5\), use a hashed cell key to avoid combinatorial explosion.
-  - Good for explicit coverage across the domain / MAP-Elites-like behavior.
-
-#### 2d. Update y-normalization statistics (`_update_normalization`)
-
-- Recompute `y_mean` and `y_std` from the **elite buffer only**.
-- This keeps normalization aligned with what the model is trained on (and reduces drift).
-
-#### 2e. Update preconditioning transform (`_update_precondition`)
-
-Preconditioning acts on **box-normalized** inputs (\([-1,1]^d\)) to improve geometry for diffusion training and sampling. The transform is computed from the current elite buffer.
-
-Let \(x_\text{norm}\) be box-normalized and \(x_c = x_\text{norm} - \mu\).
-
-Supported `precondition.type`:
-
-- **`none`**:
-  - No transform. Model trains and samples directly in \([-1,1]^d\).
-  - Best when covariance estimation is unreliable or correlations are weak.
-
-- **`standardize`**:
-  - Per-dimension scaling:
-    - \(\sigma = \text{std}(x_c)\)
-    - transform = diag(\(1/\sigma\)), inverse = diag(\(\sigma\))
-  - Motivation: make each dimension roughly unit variance; helps match the diffusion Gaussian prior and balances learning across dims.
-
-- **`whiten`**:
-  - Full covariance whitening using eigendecomposition of the sample covariance.
-  - Motivation: remove correlations so the model learns an isotropic distribution.
-  - If \(n \le d\), fall back to `standardize` because covariance is poorly conditioned.
-
-- **`whiten_shrink`**:
-  - Compute covariance via Ledoit–Wolf analytical shrinkage (toward scaled identity), then whiten.
-  - Motivation: stabilizes whitening when \(n\) is not much larger than \(d\); prevents tiny eigenvalues from causing huge scaling.
-
-- **`whiten_ema`**:
-  - Compute shrinkage covariance each iteration and maintain EMA:
-    \(\Sigma_t = (1-\eta)\Sigma_{t-1} + \eta \Sigma_{\text{current}}\)
-  - Then whiten using the EMA covariance.
-  - Motivation: preconditioning changes smoothly as the elite buffer drifts; reduces non-stationarity in the model’s input distribution.
-
-**How preconditioning changes behavior**:
-- It changes *what the diffusion model sees*: the model is trained and sampled in the transformed coordinates.
-- It changes *diversity scoring* for `quality_knn` and `crowding` because distances are computed after preconditioning (better matches the model’s geometry).
-- It can expand or rotate the data distribution; therefore the scheduler’s internal clipping must be compatible (hence `_pc_clip_range`).
-
-#### 2f. Optional periodic reinitialization (`reinit_interval`)
-
-If `reinit_interval > 0` and `_tell_count % reinit_interval == 0`:
-- reinitialize the noise predictor and optimizer state from scratch (`_reinit_model`)
-- then train for `reinit_train_steps` (typically larger than the usual adaptive steps)
-
-Motivation: the elite distribution drifts; periodic reset prevents accumulation of stale representations.
+If `reinit_interval > 0` and due: reset model weights and optimizer, then train for `reinit_epochs`.
 
 #### 2g. Prepare training tensors
 
-1. Convert elite buffer to arrays: `x_arr`, `y_arr`, filter non-finite.
-2. Compute:
-   - `x_norm = _normalize_x(x_arr)` → \([-1,1]\)
-   - `x_pc = _precondition_x(x_norm)` → preconditioned training space
-3. Update `_pc_clip_range`:
-   - If preconditioning is active, set it to cover the observed training range in preconditioned space (plus a small margin).
-   - If not, keep it at the configured scheduler range.
-4. Build conditioning labels `y_train` depending on `y_norm_type`:
-   - **`rank`**:
-     - map y-values to percentile ranks in \([0,1]\) (worst→0, best→1)
-     - optional label augmentation if `conditioning.aug = true` (top-ranked labels get small positive noise so the model is trained on values slightly above 1.0)
-   - **`mean_std`**:
-     - z-score normalization using `(y - y_mean) / y_std`
-5. Convert to torch tensors (`x_train`, `y_train`).
-6. Compute rank-based sampling weights from raw `y_arr`:
-   - weights \( \propto \exp(-\text{rank}/\text{temp}) \), where `temp = max(rank_temperature * elite_min, 1.0)`.
+1. Normalize x → [-1, 1], then [precondition](#preconditioning) → training space.
+2. Build conditioning labels using [y_norm_type](#y-normalization):
+   - `"rank"`: percentile ranks in [0, 1]. Optional [augmentation](#conditioning-augmentation) adds noise to top-ranked labels.
+   - `"mean_std"`: z-score normalization.
+3. Compute [rank-weighted sampling](#rank-weighted-sampling) probabilities.
 
-#### 2h. Train diffusion (and optional regressor) (`_train_networks`)
+#### 2h. Train networks (`_train_networks`)
 
-Training is online and repeated every `tell()` after entering exploitation stage.
-
-- **Adaptive number of steps**:
-  - Determine `steps_per_epoch = max(1, n_data // effective_batch)`.
-  - If not reinit-training, choose a number of epochs based on `train_steps` (capped), ensuring at least a few epochs even for small buffers.
-- **Per-step procedure**:
-  1. Sample indices for a mini-batch, using rank weights if available.
-  2. Optionally add small Gaussian noise to x0 (`x_noise_std`) as data augmentation.
-  3. Sample random diffusion timesteps \(t\).
-  4. Add noise via the scheduler: \(x_t = \text{add\_noise}(x_0, \epsilon, t)\).
-  5. Predict noise: \(\hat{\epsilon} = f_\theta(x_t, t, y_\text{cond})\).
-  6. Compute loss:
-     - MSE between predicted and true noise.
-     - If Min-SNR loss weighting is enabled, weight by a function of SNR(t) to prevent easy high-SNR steps dominating training.
-  7. Backprop with AdamW, clip gradients, step optimizer.
-  8. Update EMA weights.
-
-- **Early stopping**:
-  - Track a sliding window average loss.
-  - Stop if the average has not improved sufficiently for a patience window after a warmup.
+- Mini-batch SGD with [rank-weighted sampling](#rank-weighted-sampling).
+- Optional data augmentation via `x_noise_std`.
+- Forward: add noise → predict noise → [Min-SNR weighted](#min-snr-loss-weighting) MSE loss.
+- Backward: AdamW + gradient clipping + [EMA update](#ema-model).
+- [Adaptive early stopping](#adaptive-early-stopping): patience and threshold scale with optimization progress.
 
 ---
 
-### Step 3: Conditioning strategies (used in `ask()` exploitation)
+### Summary of data flow
 
-The conditioning target \(y_\text{cond}\) tells the diffusion model what “quality level” to generate.
-
-`conditioning.type` determines how \(y_\text{cond}\) is produced:
-
-- **`optimistic`**:
-  - In `rank` mode: centre at \(1.0 + \text{optimism}\), optionally add Gaussian `spread`.
-  - Motivation: ask for slightly better-than-best samples.
-
-- **`percentile_annealing`**:
-  - Choose a percentile \(p\) that rises from `p_low` to `p_high` as progress increases.
-  - In `rank` mode: centre is just \(p\) (no extrapolation).
-  - Motivation: conservative early, aggressive late, keeps conditioning within training distribution.
-
-- **`diverse_batch`**:
-  - Create a per-sample conditioning vector linearly spanning from `low_percentile` up to `best + high_offset` (or in `rank` mode, up to \(1.0 + \text{high_offset}\)).
-  - Motivation: within one batch, some samples explore moderate quality while others exploit the top.
-
-- **`combined`**:
-  - Use percentile annealing to set the “upper target” over time and a lower quantile to set the “lower target,” then spread linearly between them.
-  - Motivation: combines temporal annealing with within-batch diversity.
-
----
-
-### Step 4: Reverse diffusion inference loop (inside `ask()` exploitation)
-
-1. Sample \(x_T \sim \mathcal{N}(0, I)\) in **preconditioned space**.
-2. For each scheduler timestep \(t\) in reverse:
-   - predict noise \(\epsilon_\theta(x_t, t, y_\text{cond})\) with the inference net (EMA if enabled)
-   - optionally apply regressor guidance by subtracting a scaled gradient of predicted y wrt \(x_t\)
-   - scheduler `step()` computes the next \(x_{t-1}\), with optional internal clipping of its \(x_0\) estimate to `[-_pc_clip_range, +_pc_clip_range]`
-3. After finishing:
-   - output is \(x_0\) in preconditioned space
-   - apply `_unprecondition_x` → back to box-normalized \([-1,1]\)
-   - apply `_denormalize_x` → back to original bounds
-   - clip to bounds
-
----
-
-### Step 5: Reset (between problem instances)
-
-When moving to a new problem instance, `reset()` clears:
-- the elite buffers (`x_data`, `y_data`), counters, and best-so-far
-- y-normalization stats
-- preconditioning state (`_pc_mean`, transforms, EMA covariance) and `_pc_clip_range`
-- adaptive elite floor
-- (if Sobol is enabled) the Sobol engine
-- model weights (reinitializes networks and optimizer state)
-- verbose trace state and loss logging state
-
-Each problem instance starts completely fresh.
-
-
-### Summary of data flow through one `tell → ask` cycle
 ```
 tell(x_raw, y_raw)
   │
-  ├─ Negate y (min→max)
-  ├─ Append to elite buffer
+  ├─ Negate y (min→max), append to buffer, update global best
   ├─ Check exploration→exploitation transition
-  ├─ _update_elite() ─── score & evict ──→ elite buffer ≤ elite_size
+  ├─ _update_elite() ─── score & evict ──→ buffer ≤ capacity
+  │    └─ _pin_global_best() ─── ensure best point remains
   ├─ _update_normalization() ──→ y_mean, y_std
-  ├─ _update_precondition() ──→ _pc_mean, _pc_transform, _pc_inverse
-  ├─ x_norm = _normalize_x(x) ──→ [-1, 1]
-  ├─ x_pc = _precondition_x(x_norm) ──→ whitened/standardized
-  ├─ Update _pc_clip_range from max(|x_pc|)
-  ├─ y_cond = rank(y) ∈ [0, 1] (+ optional augmentation)
-  ├─ weights = exp(-rank / temp) (rank-weighted sampling)
+  ├─ _update_precondition() ──→ _pc_transform, _pc_inverse
+  ├─ x_pc = precondition(normalize(x))
+  ├─ y_cond = rank(y) ∈ [0,1]  (+ optional augmentation)
+  ├─ weights = exp(-rank / (rank_temp × n))
   └─ _train_networks(x_pc, y_cond, weights)
-       ├─ Forward: add noise → predict noise → Min-SNR weighted MSE
+       ├─ Forward: add noise → predict noise → Min-SNR MSE
        ├─ Backward: AdamW + grad clip + EMA update
-       └─ Early stopping if loss plateaus
+       └─ Adaptive early stopping
 
 ask(n)
   │
-  ├─ Compute explore fraction (cosine annealed)
-  ├─ Exploitation (n_exploit samples):
+  ├─ Compute explore / local / exploit fractions (cosine-annealed)
+  ├─ Exploitation (reverse diffusion):
   │    ├─ x_T ~ N(0, I)
   │    ├─ y_cond = conditioning_strategy(n_exploit)
-  │    ├─ Reverse diffusion T→0 using EMA net + DDPMScheduler(clip_range=_pc_clip_range)
-  │    ├─ x_pc = x_0 (preconditioned space)
-  │    ├─ x_norm = _unprecondition_x(x_pc) ──→ [-1, 1]
-  │    └─ x_raw = _denormalize_x(x_norm) ──→ [lower, upper]
-  ├─ Exploration (n_explore samples): uniform random in [lower, upper]
+  │    ├─ Reverse diffusion T→0  [DDPM or DDIM scheduler]
+  │    ├─ unprecondition → denormalize → clip
+  │    └─ replace NaN/Inf with random
+  ├─ Local search (mutations around anchors):
+  │    ├─ select top anchors by elite_score
+  │    ├─ covariant Gaussian mutations (σ decayed by schedule)
+  │    └─ clip to bounds
+  ├─ Exploration (uniform / sobol / LHS)
   └─ Shuffle & return
 ```
+
+---
+
+## Detailed Component Reference
+
+### Noise Predictor Architectures
+
+Set via `noise_pred_arch`:
+
+- **`concat_mlp`**: Plain MLP, concatenates [x_t, time_emb, y_cond] at input. Conditioning only enters at the first layer and can be diluted through depth.
+- **`film_resnet`** *(recommended)*: MLP with residual blocks + FiLM conditioning. Time+y conditioning is injected at every layer via learned scale+shift; LayerNorm stabilizes online training.
+- **`adaln_resnet`**: DiT-style Adaptive LayerNorm residual blocks. Zero-initialized gates make the network start near identity (predicts ~zero noise), matching the epsilon-prediction inductive bias.
+
+### EMA Model
+
+When `ema_decay > 0`, an exponential moving average of the noise predictor weights is maintained. After each training step:
+
+```
+θ_ema = ema_decay × θ_ema + (1 - ema_decay) × θ_train
+```
+
+The EMA network is used for inference in `ask()`. This smooths out online-training instability. Empirically, EMA helps at dim=2 but can hurt at dim≥5 if the decay is too slow (elite buffer shifts faster than EMA adapts). `ema_decay = -1` disables EMA entirely.
+
+### Diffusion Scheduler
+
+Training always uses `DDPMScheduler` from the `diffusers` library, configured with `num_train_timesteps`, `beta_schedule` (e.g., `squaredcos_cap_v2`), `prediction_type` (`epsilon`), and optional `clip_sample`/`clip_sample_range`.
+
+### Inference Scheduler (DDPM / DDIM)
+
+Set via `inference.type`:
+
+- **`"ddpm"`** *(default)*: Standard DDPM reverse process. Each step adds fresh random noise with variance determined by the beta schedule. Equivalent to η=1 in DDIM formulation.
+
+- **`"ddim"`**: DDIM reverse process with controllable stochasticity via `inference.eta`:
+  - `eta = 0.0`: Fully deterministic — same x_T always produces same x_0. Maximum precision but minimum diversity.
+  - `eta = 0.5` *(recommended)*: Moderate stochasticity. Provides the optimal exploration-exploitation balance — enough diversity for multi-modal search, less noise accumulation than full DDPM.
+  - `eta = 1.0`: Equivalent to DDPM.
+
+  DDIM uses the same trained noise predictor as DDPM — only the inference process changes. The `DDIMScheduler` from `diffusers` is used, accepting the same config as DDPM.
+
+### Exploration Strategies
+
+Set via `exploration.type`. Used during exploration stage and for the exploration fraction of each batch:
+
+- **`uniform`**: i.i.d. uniform samples in [lower, upper].
+- **`sobol`**: Scrambled Sobol low-discrepancy sequence. Much more uniform coverage than pure random; successive calls continue the same global sequence.
+- **`lhs`**: Latin Hypercube Sampling per call. Stratified marginal coverage but no cross-call continuation.
+
+### Exploration Annealing
+
+When `explore_anneal = True`, the exploration fraction is cosine-annealed from `explore_frac` down to 0.01 over the optimization budget. This shifts the batch composition from exploration-heavy to exploitation-heavy as the model improves.
+
+### Preconditioning
+
+Set via `precondition.type`. Applied to box-normalized [-1, 1] inputs before training and inference:
+
+- **`none`**: No transform.
+- **`standardize`**: Per-dimension scaling to unit variance.
+- **`whiten`**: Full covariance whitening via eigendecomposition. Falls back to `standardize` if n ≤ d.
+- **`whiten_shrink`** *(recommended)*: Ledoit-Wolf shrinkage covariance → whitening. Stable even when n is not much larger than d.
+- **`whiten_ema`**: EMA-smoothed shrinkage covariance → whitening.
+
+Preconditioning changes what the diffusion model sees, how diversity is scored (KNN distances are computed in preconditioned space), and requires dynamic `_pc_clip_range` adjustment for the scheduler.
+
+### Elite Buffer Management
+
+The optimizer maintains a fixed-capacity (or adaptively-sized) buffer of the best points.
+
+**Elite scoring strategies** (`elite_filter.type`):
+
+- **`quality`**: Score = y-value. Most exploitative.
+- **`quality_knn`**: Score = normalized_y + `diversity_weight` × normalized_knn_distance. Distances computed in preconditioned space. Preserves spatial diversity for multi-modal problems.
+- **`crowding`**: NSGA-II style tier + crowding distance scoring.
+- **`grid`**: MAP-Elites-like grid archive. Best point per cell gets priority.
+
+### Global Best Pinning
+
+After every elite eviction, the global best point is guaranteed to remain in the buffer. If the best point was evicted (e.g., by a diversity-based filter), it is appended back. This ensures the model always trains on the best-known solution.
+
+### Adaptive Elite
+
+When `elite_adaptive.enabled = True`, the buffer capacity shrinks linearly from `elite_max` to `elite_min` over the optimization budget (LSHADE-style). A soft quality floor gradually rises, preventing the buffer from retaining very poor points.
+
+### Conditioning Strategies
+
+Set via `conditioning.type`. Determines the y_cond values used during reverse diffusion in `ask()`:
+
+- **`optimistic`**: y_cond = 1.0 + `optimism`, with optional Gaussian `spread` across the batch.
+- **`percentile_annealing`**: y_cond = annealing percentile of elite buffer (from `p_low` to `p_high`), with optional `spread`. Always within training distribution — no extrapolation.
+- **`diverse_batch`** *(recommended)*: Each sample gets a different y_cond, linearly spaced from `low_percentile` to 1.0 + `high_offset`. Creates an exploration-exploitation spectrum within each batch.
+- **`combined`**: Annealed percentile sets upper bound, diverse batch provides within-batch spread.
+
+### Conditioning Augmentation
+
+When `conditioning.aug = True` and `y_norm_type = "rank"`, training labels for top-20% points (rank ≥ 0.8) are augmented with small positive uniform noise [0, alpha]. This extends the training distribution above 1.0 so inference targets (which may request y_cond > 1.0) fall within the trained range. Alpha is derived from the conditioning parameters (e.g., `optimism` or `high_offset`).
+
+**Note**: Empirically, aug=False with DDIM η=0.5 performs better than aug=True, as augmentation blurs the conditioning signal that diverse_batch relies on.
+
+### Rank-Weighted Sampling
+
+Training mini-batches are sampled with rank-based weights:
+
+```
+weight(rank) = exp(-rank / (rank_temperature × n))
+```
+
+where n is the current buffer size. `rank_temperature` controls focus: 0.3 = sharper focus on top points, 0.5 = moderate, 0.8 = nearly uniform. The temperature scales with buffer size so the effective "active fraction" remains constant regardless of buffer capacity.
+
+### Y-Normalization
+
+Set via `y_norm_type`:
+
+- **`rank`** *(recommended)*: Map y-values to percentile ranks in [0, 1] (worst → 0, best → 1). Stable across iterations, avoids extrapolation issues.
+- **`mean_std`**: Z-score normalization using elite buffer statistics.
+
+### Min-SNR Loss Weighting
+
+When `snr_loss_weighting = True`, the per-timestep diffusion loss is weighted by `min(SNR(t), γ) / SNR(t)`. This reduces dominance of easy high-SNR timesteps (small t, low noise) and focuses training on informative medium-noise timesteps.
+
+### Adaptive Early Stopping
+
+Training uses early stopping with parameters that adapt to optimization progress:
+
+- **Patience**: 5 → 20 (increases with progress — late-phase training gets more time for fine-tuning)
+- **Relative delta**: 2% → 0.5% (tightens with progress — demands smaller improvements to continue)
+- **Warmup**: at least 2 full epochs before early stopping activates
+
+This ensures: early in optimization (volatile data), training stops quickly to avoid overfitting stale data. Late in optimization (stable buffer), training runs longer for precise model refinement.
+
+### Local Search
+
+When `local_search.enabled = True`, a fraction of the batch is generated via mutation of anchor points from the elite buffer, bypassing the diffusion model entirely:
+
+1. **Anchor selection**: Top `n_anchors` points by elite score.
+2. **Mutation**: Gaussian perturbations scaled by σ. If `use_covariance = True` and preconditioning is active, mutations follow the learned correlation structure via the inverse preconditioning matrix.
+3. **Sigma schedule** (`sigma_decay`):
+   - `"quadratic"` *(recommended)*: σ = σ_init × (1 − progress)². Smooth, deterministic, monotonically decreasing.
+   - `"one_fifth"`: Adaptive 1/5 success rule. Increases σ if >20% of mutations improve, decreases otherwise.
+   - `"linear"`: σ = σ_init × max(1 − progress, 0.01).
+4. **Fraction annealing**: When `anneal = True`, the local search fraction cosine-grows from `frac` to `frac_max` over the budget, increasing local refinement as the model matures.
+
+Local search is especially effective on rugged/fractal landscapes (e.g., Weierstrass, Katsuura) where the diffusion model cannot learn useful structure. The mutation-based approach operates independently of model quality.

@@ -1,16 +1,17 @@
 {
+    "_description": "Stage-1E: EMA=0.95 + uniform exploration. Isolates sobol vs uniform effect under EMA.",
     "method": "diffusion_v2",
     "algorithm_name": "DiffusionV2",
     "suite_name": "bbob",
     "suite_instance": "",
-    "suite_options": "dimensions: 2,5,10 instance_indices: 1-2",
+    "suite_options": "dimensions: 10 instance_indices: 1-2",
     "budget_multiplier": 1024,
     "eval_batch_size": 64,
     "precision": 0.1,
-    "output_folder": "rm/optimal/stage-2/diverse_batch/sobol/low_percentile0.7_high_offset0.2",
+    "output_folder": "rm/optimal/stage-1/ddim/ema95_uniform",
     "post_process": false,
     "optimizer": {
-        "num_timesteps": 100,
+        "num_timesteps": 50,
         "beta_schedule": "squaredcos_cap_v2",
         "prediction_type": "epsilon",
         "clip_sample": true,
@@ -21,7 +22,7 @@
         "depth": 3,
         "batch_size": 128,
         "lr_diffusion": 0.001,
-        "num_epochs": 100,
+        "num_epochs": 50,
         "elite_min_per_dim": 32,
         "elite_max_per_dim": 128,
         "elite_filter": {
@@ -32,21 +33,17 @@
             "type": "whiten_shrink"
         },
         "exploration": {
-            "type": "sobol"
+            "type": "uniform"
         },
         "local_search": {
             "enabled": false
         },
-        "inference": {
-            "type": "ddim",
-            "eta": 0.5
-        },
         "explore_frac": 0.05,
         "explore_anneal": true,
         "conditioning": {
-            "type": "diverse_batch",
-            "low_percentile": 0.7,
-            "high_offset": 0.2,
+            "type": "optimistic",
+            "optimism": 0.1,
+            "spread": 0.0,
             "aug": false
         },
         "rank_temperature": 0.5,
@@ -55,7 +52,7 @@
         "x_noise_std": 0.01,
         "snr_loss_weighting": true,
         "snr_gamma": 5.0,
-        "ema_decay": -1,
+        "ema_decay": 0.95,
         "reinit_interval": 0,
         "reinit_epochs": 50,
         "seed": 42,
