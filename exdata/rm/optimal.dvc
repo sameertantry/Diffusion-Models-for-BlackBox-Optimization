@@ -1,0 +1,6 @@
+outs:
+- md5: 0f4ec52b6d548ff733ffe467ca27c5b6.dir
+  size: 7411813270
+  nfiles: 52697
+  hash: md5
+  path: optimal
