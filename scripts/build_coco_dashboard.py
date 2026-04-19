@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import http.server
 import json
 import math
@@ -418,7 +419,20 @@ def _process_single_npz(npz_path: Path) -> Optional[dict]:
     }
 
 
-def load_experiment(exp_dir: Path, project_root: Path, exp_index: int) -> Optional[Experiment]:
+def _stable_exp_id(rel_path: str) -> str:
+    """Deterministic experiment id derived from relative path.
+
+    Using the index of the enumeration produced non-stable ids across
+    dashboard rebuilds (inserting a new experiment shifted every id after
+    it). A content-addressable id keeps the id stable for a given path,
+    which in turn allows the frontend to reliably persist the current
+    selection in ``localStorage``.
+    """
+    digest = hashlib.sha1(rel_path.encode("utf-8")).hexdigest()[:12]
+    return f"exp_{digest}"
+
+
+def load_experiment(exp_dir: Path, project_root: Path) -> Optional[Experiment]:
     csv_path = exp_dir / CSV_NAME
     if csv_path.exists():
         method_name, records = load_from_csv(csv_path)
@@ -432,7 +446,7 @@ def load_experiment(exp_dir: Path, project_root: Path, exp_index: int) -> Option
 
     rel_path = str(exp_dir.relative_to(project_root))
     name = method_name or exp_dir.name
-    exp_id = f"exp_{exp_index:04d}"
+    exp_id = _stable_exp_id(rel_path)
     verbose_traces = _scan_verbose_metadata(exp_dir, records)
     loss_traces = _scan_loss_metadata(exp_dir)
     return Experiment(
@@ -449,15 +463,28 @@ def load_experiment(exp_dir: Path, project_root: Path, exp_index: int) -> Option
 
 
 def choose_preselected(experiments: List[Experiment], explicit_paths: List[Path]) -> List[str]:
-    if explicit_paths:
-        normalized = {str(path.resolve()) for path in explicit_paths}
-        selected = [
-            exp.exp_id
-            for exp in experiments
-            if str(exp.abs_path.resolve()) in normalized
-        ]
-        return selected
-    return [exp.exp_id for exp in experiments[:3]]
+    """Resolve ``--select`` paths to experiment ids, preserving CLI order.
+
+    When no explicit paths are given we return an empty list instead of
+    silently preselecting the first three experiments. The previous default
+    shifted whenever a new experiment appeared in the scan, which produced
+    different charts just from re-running the benchmark.
+    """
+    if not explicit_paths:
+        return []
+
+    path_to_id: Dict[str, str] = {
+        str(exp.abs_path.resolve()): exp.exp_id for exp in experiments
+    }
+    selected: List[str] = []
+    seen: Set[str] = set()
+    for path in explicit_paths:
+        resolved = str(path.resolve())
+        exp_id = path_to_id.get(resolved)
+        if exp_id is not None and exp_id not in seen:
+            selected.append(exp_id)
+            seen.add(exp_id)
+    return selected
 
 
 def assign_unique_display_names(experiments: List[Experiment]) -> None:
@@ -1222,9 +1249,56 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
     const RAW = __DATA_PAYLOAD__;
     const EXPERIMENTS = RAW.experiments;
     const RECORDS = RAW.records;
-    const PRESELECTED = new Set(RAW.preselectedExperimentIds || []);
     const TREE = RAW.tree;
     const BBOB_NAMES = __BBOB_NAMES__;
+
+    // Path<->id maps are used to persist the selection across rebuilds by
+    // relative path (ids are stable content hashes, but we still rely on
+    // path mapping so that older browser state remains portable).
+    const ID_TO_PATH = {}, PATH_TO_ID = {};
+    for (const exp of EXPERIMENTS) { ID_TO_PATH[exp.id] = exp.path; PATH_TO_ID[exp.path] = exp.id; }
+
+    const STORAGE_KEY = 'coco_dashboard_selection_v2';
+    function loadStoredSelection() {
+      try {
+        const raw = localStorage.getItem(STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) return null;
+        return parsed;
+      } catch (e) { return null; }
+    }
+    function saveStoredSelection() {
+      try {
+        const paths = [];
+        for (const id of PRESELECTED) {
+          const p = ID_TO_PATH[id];
+          if (p) paths.push(p);
+        }
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(paths));
+      } catch (e) {}
+    }
+    function clearStoredSelection() {
+      try { localStorage.removeItem(STORAGE_KEY); } catch (e) {}
+    }
+
+    const PRESELECTED = new Set();
+    (function initPreselection() {
+      // Priority: localStorage (persists the user's last choice across
+      // rebuilds/reloads) -> payload preselect from --select CLI args.
+      const stored = loadStoredSelection();
+      if (stored && stored.length) {
+        for (const p of stored) {
+          const id = PATH_TO_ID[p];
+          if (id) PRESELECTED.add(id);
+        }
+      }
+      if (!PRESELECTED.size) {
+        for (const id of (RAW.preselectedExperimentIds || [])) {
+          if (ID_TO_PATH[id]) PRESELECTED.add(id);
+        }
+      }
+    })();
 
     // BBOB function groups
     const BBOB_GROUPS = {
@@ -1305,15 +1379,19 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       var active = document.querySelectorAll('.func-group-chip.active');
       if (!active.length) {
         document.getElementById('functionFilter').value = '';
-        return;
+      } else {
+        var funcs = [];
+        active.forEach(function(chip) {
+          var g = BBOB_GROUPS[chip.dataset.group];
+          if (g) funcs = funcs.concat(g.funcs);
+        });
+        funcs = [...new Set(funcs)].sort(function(a,b) { return a - b; });
+        document.getElementById('functionFilter').value = funcs.join(',');
       }
-      var funcs = [];
-      active.forEach(function(chip) {
-        var g = BBOB_GROUPS[chip.dataset.group];
-        if (g) funcs = funcs.concat(g.funcs);
-      });
-      funcs = [...new Set(funcs)].sort(function(a,b) { return a - b; });
-      document.getElementById('functionFilter').value = funcs.join(',');
+      // Re-run the comparison so clicking a chip immediately updates the
+      // charts. Previously the user had to also press Enter or
+      // "Compare Selected", which made the UI feel unresponsive.
+      if (typeof refreshAll === 'function') refreshAll();
     }
 
     const PALETTE = ['#4361ee','#ef4444','#10b981','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316','#6366f1'];
@@ -1492,6 +1570,7 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       cb.addEventListener('change', () => {
         if (cb.checked) PRESELECTED.add(exp.id);
         else PRESELECTED.delete(exp.id);
+        saveStoredSelection();
       });
       const info = document.createElement('div');
       info.innerHTML = '<span class="leaf-name">' + escapeHtml(exp.display_name || exp.name) + '</span> ' +
@@ -1618,10 +1697,26 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       for (const a of ids) { pairwiseWinsMatrix[a] = {}; for (const b of ids) pairwiseWinsMatrix[a][b] = 0; }
 
       const convergenceByDimExp = {};
+      // Per-(experiment, function, dimension) convergence counters are
+      // populated from shared triplets only so that the per-function
+      // Convergence-Rate chart uses the exact same denominator as the
+      // global view (was previously pulled from RECORDS, which ignored
+      // the shared-triplet restriction and the instance filter).
+      const convergenceByFuncDimExp = {};
+
+      // Tracks how many shared triplets were dropped because at least one
+      // selected experiment had a missing/non-finite metric value.
+      let skippedDueToMissingMetric = 0;
+
+      // Small epsilon used when one experiment reaches the precision
+      // target (metric == 0) to keep log-ratios finite. Chosen to match
+      // the default BBOB precision (1e-8) — a run that is already at the
+      // target should not be treated as infinitely better than a run that
+      // is only slightly above it.
+      const LOG_RATIO_EPS = 1e-8;
 
       for (const key of shared) {
         const [f, d, i] = key.split('|').map(Number);
-        functionSet.add(f); dimSet.add(d); insSet.add(i);
 
         const values = [];
         for (const id of ids) {
@@ -1630,7 +1725,12 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
           if (val === null || !Number.isFinite(val)) continue;
           values.push({ id, val, rec });
         }
-        if (values.length !== ids.length) continue;
+        if (values.length !== ids.length) {
+          skippedDueToMissingMetric++;
+          continue;
+        }
+
+        functionSet.add(f); dimSet.add(d); insSet.add(i);
 
         let bestVal = values[0].val;
         for (const item of values) {
@@ -1642,7 +1742,7 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         if (!winners.length) winners = [values[0].id];
         for (const wid of winners) { wins[wid] += 1/winners.length; if (winners.length > 1) ties[wid]++; }
 
-        // Pairwise
+        // Pairwise strict wins (ties contribute to neither side).
         for (let a = 0; a < values.length; a++) {
           for (let b = 0; b < values.length; b++) {
             if (a === b) continue;
@@ -1652,10 +1752,25 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         }
 
         for (const item of values) {
-          const ratio = direction(metric) === 'lower'
-            ? item.val / (bestVal || 1e-15)
-            : (bestVal || 1e-15) / (item.val || 1e-15);
-          relByExp[item.id].push(Math.log10(Math.max(ratio, 1e-15)));
+          // log10 ratio is only meaningful for non-negative magnitudes.
+          // For the "success" metric (values in {0, 1}) the ratio is not
+          // informative, so we skip it entirely and show a friendly note
+          // in renderPlots.
+          if (metric !== 'success') {
+            let ratio;
+            if (direction(metric) === 'lower') {
+              const num = Math.max(item.val, 0) + LOG_RATIO_EPS;
+              const den = Math.max(bestVal, 0) + LOG_RATIO_EPS;
+              ratio = num / den;
+            } else {
+              const num = Math.max(bestVal, 0) + LOG_RATIO_EPS;
+              const den = Math.max(item.val, 0) + LOG_RATIO_EPS;
+              ratio = num / den;
+            }
+            if (Number.isFinite(ratio) && ratio > 0) {
+              relByExp[item.id].push(Math.log10(ratio));
+            }
+          }
 
           const gKey = item.id + '|' + f;
           if (!gapsByExpFunc[gKey]) gapsByExpFunc[gKey] = [];
@@ -1665,6 +1780,11 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
           if (!convergenceByDimExp[cKey]) convergenceByDimExp[cKey] = { total: 0, converged: 0 };
           convergenceByDimExp[cKey].total++;
           if (item.rec.converged || item.rec.final_target_hit) convergenceByDimExp[cKey].converged++;
+
+          const cfKey = item.id + '|' + f + '|' + d;
+          if (!convergenceByFuncDimExp[cfKey]) convergenceByFuncDimExp[cfKey] = { total: 0, converged: 0 };
+          convergenceByFuncDimExp[cfKey].total++;
+          if (item.rec.converged || item.rec.final_target_hit) convergenceByFuncDimExp[cfKey].converged++;
         }
 
         if (!metricByDim.has(d)) metricByDim.set(d, []);
@@ -1763,7 +1883,9 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         validKeyCount, functionIds: [...functionSet].sort((a,b) => a-b),
         dimensions: [...dimSet].sort((a,b) => a-b), instances: [...insSet].sort((a,b) => a-b),
         wins, relByExp, metricByDim, rankByFunction, gapsByExpFunc, pairwiseWinsMatrix,
-        convergenceByDimExp,
+        convergenceByDimExp, convergenceByFuncDimExp,
+        totalSharedKeyCount: shared.size,
+        skippedDueToMissingMetric,
       };
     }
 
@@ -1790,14 +1912,35 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         r.functionIds.map(f => '<option value="'+f+'">f'+f+' '+escapeHtml((BBOB_NAMES[f]||'').substring(0,20))+'</option>').join('');
       const dimOpts = '<option value="all">All dimensions</option>' +
         r.dimensions.map(d => '<option value="'+d+'">d='+d+'</option>').join('');
-      ['dimScalingFuncFilter','ecdfFuncFilter','convFuncFilter'].forEach(id => {
+      const resetNotices = [];
+      const applyOpts = (id, opts, label) => {
         const el = document.getElementById(id);
-        if (el) { const old = el.value; el.innerHTML = funcOpts; if ([...el.options].some(o=>o.value===old)) el.value = old; }
-      });
-      ['funcRankDimFilter','ecdfDimFilter','medianGapDimFilter'].forEach(id => {
-        const el = document.getElementById(id);
-        if (el) { const old = el.value; el.innerHTML = dimOpts; if ([...el.options].some(o=>o.value===old)) el.value = old; }
-      });
+        if (!el) return;
+        const old = el.value;
+        el.innerHTML = opts;
+        if (old && old !== 'all' && [...el.options].some(o => o.value === old)) {
+          el.value = old;
+        } else if (old && old !== 'all') {
+          // Previous chart-local filter is no longer present in the shared
+          // set; fall back to "all" but let the user know so they don't
+          // think the plot content changed silently.
+          el.value = 'all';
+          resetNotices.push(label + ' reset to "all"');
+        } else {
+          el.value = 'all';
+        }
+      };
+      applyOpts('dimScalingFuncFilter', funcOpts, 'Dimension-scaling function filter');
+      applyOpts('ecdfFuncFilter', funcOpts, 'ECDF function filter');
+      applyOpts('convFuncFilter', funcOpts, 'Convergence-rate function filter');
+      applyOpts('funcRankDimFilter', dimOpts, 'Function-rank dimension filter');
+      applyOpts('ecdfDimFilter', dimOpts, 'ECDF dimension filter');
+      applyOpts('medianGapDimFilter', dimOpts, 'Median-gap dimension filter');
+      if (resetNotices.length) {
+        const current = document.getElementById('statusMessage').textContent || '';
+        const suffix = '  Note: ' + resetNotices.join('; ') + ' because those values are no longer in the shared set.';
+        document.getElementById('statusMessage').textContent = current + suffix;
+      }
     }
 
     function renderPlots(r) {
@@ -1816,15 +1959,25 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         margin: { l: 50, r: 20, t: 50, b: 80 }, bargap: 0.3,
       }, { responsive: true });
 
-      // 2) Relative distribution
-      Plotly.newPlot('plotRelative', ids.map((id, i) => ({
-        type: 'box', name: expName(id), y: r.relByExp[id].map(v => R(v,4)), boxpoints: 'outliers',
-        marker: { color: color(i), opacity: 0.7 }, line: { color: color(i) },
-      })), { ...PLOTLY_LAYOUT_BASE, title: { text: 'Relative ' + metric + ' distribution (log\u2081\u2080 scale)', font: { size: 14 } },
-        yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis, title: 'log\u2081\u2080(ratio to best)', tickformat: '.2f' },
-        xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, categoryorder: 'array', categoryarray: expNames },
-        margin: { l: 60, r: 20, t: 50, b: 80 }, showlegend: false,
-      }, { responsive: true });
+      // 2) Relative distribution (only meaningful for continuous
+      //    metrics; for the binary success metric the log-ratio is not
+      //    informative, so show a placeholder instead of empty boxes).
+      if (metric === 'success') {
+        Plotly.purge('plotRelative');
+        document.getElementById('plotRelative').innerHTML =
+          '<div style="padding:20px;text-align:center;color:#888;">' +
+          'Relative distribution is not applicable for the success metric.' +
+          '</div>';
+      } else {
+        Plotly.newPlot('plotRelative', ids.map((id, i) => ({
+          type: 'box', name: expName(id), y: r.relByExp[id].map(v => R(v,4)), boxpoints: 'outliers',
+          marker: { color: color(i), opacity: 0.7 }, line: { color: color(i) },
+        })), { ...PLOTLY_LAYOUT_BASE, title: { text: 'Relative ' + metric + ' distribution (log\u2081\u2080 scale)', font: { size: 14 } },
+          yaxis: { ...PLOTLY_LAYOUT_BASE.yaxis, title: 'log\u2081\u2080(ratio to best)', tickformat: '.2f' },
+          xaxis: { ...PLOTLY_LAYOUT_BASE.xaxis, categoryorder: 'array', categoryarray: expNames },
+          margin: { l: 60, r: 20, t: 50, b: 80 }, showlegend: false,
+        }, { responsive: true });
+      }
 
       renderDimensionScaling(r);
       renderFunctionRankHeatmap(r);
@@ -1935,19 +2088,30 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
       const filterFunc = funcVal !== 'all' ? Number(funcVal) : null;
       const filterDim = dimVal !== 'all' ? Number(dimVal) : null;
 
+      // Epsilon used to pin exactly-solved runs (metric == 0) onto the
+      // log-scale x-axis. Anything <= eps is considered "solved" for
+      // ECDF purposes so that the curve of a converged method reaches 1.
+      const ECDF_EPS = 1e-12;
       const ecdfTraces = ids.map((id, i) => {
+        let totalInScope = 0;
         const vals = [];
         for (const row of r.sharedRows) {
           if (filterFunc !== null && row.function_id !== filterFunc) continue;
           if (filterDim !== null && row.dimension !== filterDim) continue;
           const col = 'metric__' + expName(id);
-          if (Number.isFinite(row[col]) && row[col] > 0) vals.push(row[col]);
+          const raw = row[col];
+          if (!Number.isFinite(raw)) continue;
+          totalInScope++;
+          // Clamp non-positive values to ECDF_EPS so that exactly-solved
+          // runs still contribute to the curve instead of being silently
+          // dropped by the log axis.
+          vals.push(raw <= 0 ? ECDF_EPS : raw);
         }
         vals.sort((a,b) => a - b);
-        const n = vals.length || 1;
+        const denom = totalInScope || 1;
         return {
           type: 'scatter', mode: 'lines', name: expName(id),
-          x: vals, y: vals.map((_, j) => R((j + 1) / n, 4)),
+          x: vals, y: vals.map((_, j) => R((j + 1) / denom, 4)),
           line: { color: color(i), width: 2 },
         };
       });
@@ -1975,7 +2139,8 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
           y: r.dimensions.map(d => {
             const ck = id + '|' + d;
             const c = r.convergenceByDimExp[ck];
-            return c ? R(c.converged * 100 / c.total, 1) : 0;
+            if (!c || !c.total) return null;
+            return R(c.converged * 100 / c.total, 1);
           }),
           marker: { color: color(i) },
         }));
@@ -1991,11 +2156,13 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
           type: 'bar', name: expName(id),
           x: r.dimensions.map(d => 'd=' + d),
           y: r.dimensions.map(d => {
-            const matching = r.sharedRows.filter(row => row.function_id === filterFunc && row.dimension === d);
-            if (!matching.length) return 0;
-            const expRecs = RECORDS.filter(rec => rec.experiment_id === id && rec.function_id === filterFunc && rec.dimension === d);
-            const conv = expRecs.filter(rec => rec.converged || rec.final_target_hit).length;
-            return matching.length ? R(conv * 100 / matching.length, 1) : 0;
+            // Always read from the shared-triplet aggregate so that the
+            // numerator and denominator refer to the same set of triplets
+            // and respect the global function/dimension/instance filters.
+            const cfKey = id + '|' + filterFunc + '|' + d;
+            const c = r.convergenceByFuncDimExp[cfKey];
+            if (!c || !c.total) return null;
+            return R(c.converged * 100 / c.total, 1);
           }),
           marker: { color: color(i) },
         }));
@@ -2091,7 +2258,8 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
           { title: 'Median Metric', field: 'median_metric', sorter: 'number', formatter: numFmt, hozAlign: 'right' },
           { title: 'Wins', field: 'wins', sorter: 'number', hozAlign: 'right' },
           { title: 'Win Rate %', field: 'win_rate_pct', sorter: 'number', hozAlign: 'right', formatter: pctFmt },
-          { title: 'Ties', field: 'ties', sorter: 'number', hozAlign: 'right' },
+          { title: 'Tied Wins', field: 'ties', sorter: 'number', hozAlign: 'right',
+            tooltip: 'Number of shared triplets where this experiment was tied for first place.' },
           { title: 'Mean log10 Ratio', field: 'mean_log10_ratio', sorter: 'number', formatter: numFmt, hozAlign: 'right' },
         ],
         initialSort: [{ column: 'win_rate_pct', dir: 'desc' }],
@@ -2126,7 +2294,8 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
           { title: 'Experiment B', field: 'experiment_b', headerFilter: 'input', minWidth: 130 },
           { title: 'A Wins', field: 'wins_a', sorter: 'number', hozAlign: 'right' },
           { title: 'B Wins', field: 'wins_b', sorter: 'number', hozAlign: 'right' },
-          { title: 'Ties', field: 'ties', sorter: 'number', hozAlign: 'right' },
+          { title: 'A == B', field: 'ties', sorter: 'number', hozAlign: 'right',
+            tooltip: 'Shared triplets where A and B reported the exact same metric value (no strict winner in this pair).' },
           { title: 'A Rate %', field: 'a_rate', sorter: 'number', hozAlign: 'right', formatter: pctFmt },
           { title: 'B Rate %', field: 'b_rate', sorter: 'number', hozAlign: 'right', formatter: pctFmt },
         ],
@@ -2477,7 +2646,14 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
         return;
       }
       lastResult = result;
-      setStatus('Compared ' + result.selected.length + ' experiments on ' + result.validKeyCount + ' shared triplets with metric "' + result.metric + '".', false);
+      let statusText = 'Compared ' + result.selected.length + ' experiments on ' +
+        result.validKeyCount + ' shared triplets with metric "' + result.metric + '".';
+      if (result.skippedDueToMissingMetric > 0) {
+        statusText += ' ' + result.skippedDueToMissingMetric +
+          ' triplets were excluded because at least one experiment had no finite ' +
+          result.metric + ' value.';
+      }
+      setStatus(statusText, false);
       updateKpis(result);
       populateChartFilters(result);
       renderPlots(result);
@@ -2504,12 +2680,36 @@ _DASHBOARD_TEMPLATE = r"""<!doctype html>
 
     // ===== EVENT LISTENERS =====
     document.getElementById('searchExperiments').addEventListener('input', filterTree);
+
+    function currentlyVisibleExperiments() {
+      // When a search query is active, "Select All" should only affect
+      // the experiments the user is currently looking at — otherwise the
+      // invisible rows quietly change the comparison.
+      const q = document.getElementById('searchExperiments').value.toLowerCase().trim();
+      if (!q) return EXPERIMENTS;
+      return EXPERIMENTS.filter(e => {
+        const text = (e.display_name + ' ' + e.name + ' ' + e.path).toLowerCase();
+        return text.includes(q);
+      });
+    }
+
     document.getElementById('btnSelectAll').addEventListener('click', () => {
-      for (const exp of EXPERIMENTS) PRESELECTED.add(exp.id);
-      buildTreeUI(); refreshAll();
+      for (const exp of currentlyVisibleExperiments()) PRESELECTED.add(exp.id);
+      saveStoredSelection();
+      filterTree();
+      refreshAll();
     });
     document.getElementById('btnClearAll').addEventListener('click', () => {
-      PRESELECTED.clear(); buildTreeUI(); refreshAll();
+      const visible = currentlyVisibleExperiments();
+      if (visible.length === EXPERIMENTS.length) {
+        PRESELECTED.clear();
+        clearStoredSelection();
+      } else {
+        for (const exp of visible) PRESELECTED.delete(exp.id);
+        saveStoredSelection();
+      }
+      filterTree();
+      refreshAll();
     });
     document.getElementById('btnRefresh').addEventListener('click', refreshAll);
     document.getElementById('metricSelect').addEventListener('change', refreshAll);
@@ -2630,8 +2830,8 @@ def _build_dashboard(args, project_root: Path) -> Tuple[Path, int]:
         raise SystemExit("No experiment directories found under provided roots.")
 
     experiments: List[Experiment] = []
-    for idx, exp_dir in enumerate(experiment_dirs, start=1):
-        exp = load_experiment(exp_dir, project_root, idx)
+    for exp_dir in experiment_dirs:
+        exp = load_experiment(exp_dir, project_root)
         if exp is not None:
             experiments.append(exp)
 
