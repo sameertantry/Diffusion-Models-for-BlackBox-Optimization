@@ -79,10 +79,13 @@ if TYPE_CHECKING:
     import cocoex  # noqa: F401 – used for type hints only
 
 from methods.base import BaseOptimizer
+from methods.bipop_cma_es import BIPOPCMAES
 from methods.cma_es import CMAES
 from methods.diffusion import DiffusionOptimizer
 from methods.diffusion_bbo import DiffusionBBO
 from methods.diffusion_v2 import DiffusionOptimizerV2
+from methods.gp_qei import GPqEI
+from methods.sep_cma_es import SepCMAES
 from methods.tpe import TPE
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +289,67 @@ def make_tpe_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
     return _factory
 
 
+def make_gp_qei_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
+    """Create a factory that produces :class:`GPqEI` instances.
+
+    Parameters
+    ----------
+    **optimizer_kwargs
+        Keyword arguments accepted by :class:`GPqEI`
+        (``seed``, ``n_initial``, ``mc_samples``, ``num_restarts``,
+        ``raw_samples``, ``max_train_size``, ``device``, ``dtype``).
+
+    Returns
+    -------
+    OptimizerFactory
+        A callable ``(dimension, lower_bounds, upper_bounds) -> GPqEI``.
+    """
+
+    def _factory(
+        dimension: int,
+        lower_bounds: np.ndarray,
+        upper_bounds: np.ndarray,
+    ) -> GPqEI:
+        return GPqEI(
+            input_dim=dimension,
+            bounds=(lower_bounds, upper_bounds),
+            **optimizer_kwargs,
+        )
+
+    return _factory
+
+
+def make_turbo_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
+    """Create a factory that produces :class:`~methods.turbo.TuRBO` instances.
+
+    Parameters
+    ----------
+    **optimizer_kwargs
+        Keyword arguments accepted by :class:`~methods.turbo.TuRBO`
+        (``seed``, ``n_initial``, ``n_trust_regions``, ``batch_size``,
+        ``max_cholesky_size``, ``device``, ``dtype``).
+
+    Returns
+    -------
+    OptimizerFactory
+        A callable ``(dimension, lower_bounds, upper_bounds) -> TuRBO``.
+    """
+
+    def _factory(
+        dimension: int,
+        lower_bounds: np.ndarray,
+        upper_bounds: np.ndarray,
+    ):  # type: ignore[return]
+        from methods.turbo import TuRBO
+        return TuRBO(
+            input_dim=dimension,
+            bounds=(lower_bounds, upper_bounds),
+            **optimizer_kwargs,
+        )
+
+    return _factory
+
+
 def make_diffusion_bbo_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
     """Create a factory that produces :class:`DiffusionBBO` instances.
 
@@ -344,13 +408,51 @@ def make_diffusion_v2_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
     return _factory
 
 
+def make_sep_cmaes_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
+    """Create a factory that produces :class:`SepCMAES` instances."""
+
+    def _factory(
+        dimension: int,
+        lower_bounds: np.ndarray,
+        upper_bounds: np.ndarray,
+    ) -> SepCMAES:
+        return SepCMAES(
+            input_dim=dimension,
+            bounds=(lower_bounds, upper_bounds),
+            **optimizer_kwargs,
+        )
+
+    return _factory
+
+
+def make_bipop_cmaes_factory(**optimizer_kwargs: Any) -> OptimizerFactory:
+    """Create a factory that produces :class:`BIPOPCMAES` instances."""
+
+    def _factory(
+        dimension: int,
+        lower_bounds: np.ndarray,
+        upper_bounds: np.ndarray,
+    ) -> BIPOPCMAES:
+        return BIPOPCMAES(
+            input_dim=dimension,
+            bounds=(lower_bounds, upper_bounds),
+            **optimizer_kwargs,
+        )
+
+    return _factory
+
+
 # Registry: method name -> factory builder
 _FACTORY_BUILDERS: Dict[str, Callable[..., OptimizerFactory]] = {
     "diffusion": make_diffusion_factory,
     "diffusion_v2": make_diffusion_v2_factory,
     "diffusion_bbo": make_diffusion_bbo_factory,
     "cma_es": make_cmaes_factory,
+    "sep_cma_es": make_sep_cmaes_factory,
+    "bipop_cma_es": make_bipop_cmaes_factory,
     "tpe": make_tpe_factory,
+    "gp_qei": make_gp_qei_factory,
+    "turbo": make_turbo_factory,
 }
 
 
@@ -1002,7 +1104,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Run a COCO/BBOB experiment with a black-box optimizer "
-            "(diffusion, diffusion_bbo, cma_es, or tpe)."
+            "(diffusion, diffusion_bbo, cma_es, tpe, or gp_qei)."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -1020,7 +1122,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--method",
         type=str,
         default="diffusion",
-        choices=["diffusion", "diffusion_bbo", "cma_es", "tpe"],
+        choices=["diffusion", "diffusion_bbo", "cma_es", "tpe", "gp_qei"],
         help="Optimizer method to benchmark.",
     )
     parser.add_argument(
@@ -1112,6 +1214,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--p-uncond", type=float, default=0.15)
     parser.add_argument("--guidance-scale", type=float, default=2.0)
     parser.add_argument("--n-uae-samples", type=int, default=20)
+    # --- GP-qEI specific ---
+    parser.add_argument("--n-initial", type=int, default=None)
+    parser.add_argument("--mc-samples", type=int, default=256)
+    parser.add_argument("--gp-num-restarts", type=int, default=10)
+    parser.add_argument("--gp-raw-samples", type=int, default=512)
+    parser.add_argument("--max-train-size", type=int, default=None)
+    parser.add_argument("--gp-dtype", type=str, default="float64")
     return parser
 
 
@@ -1158,6 +1267,16 @@ _CLI_KWARGS_DIFFUSION_BBO = {
     "device": "device",
 }
 
+_CLI_KWARGS_GP_QEI = {
+    "n_initial": "n_initial",
+    "mc_samples": "mc_samples",
+    "gp_num_restarts": "num_restarts",
+    "gp_raw_samples": "raw_samples",
+    "max_train_size": "max_train_size",
+    "device": "device",
+    "gp_dtype": "dtype",
+}
+
 
 def _cli_to_optimizer_kwargs(
     args: argparse.Namespace,
@@ -1171,6 +1290,8 @@ def _cli_to_optimizer_kwargs(
         mapping.update(_CLI_KWARGS_DIFFUSION_BBO)
     elif method == "cma_es":
         mapping.update(_CLI_KWARGS_CMAES)
+    elif method == "gp_qei":
+        mapping.update(_CLI_KWARGS_GP_QEI)
     # TPE only uses the shared keys (seed).
 
     kwargs: Dict[str, Any] = {}
